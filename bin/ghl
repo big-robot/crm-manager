@@ -11,6 +11,7 @@ import urllib.request
 
 BASE_URL = "https://services.leadconnectorhq.com"
 VERSION = "2021-07-28"
+CLI_VERSION = "0.1.0"
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 GENERIC_DEFAULT_PIPELINE = "Sales Pipeline"
 GENERIC_CANONICAL_STAGES = [
@@ -191,7 +192,7 @@ def request(method, path, *, query=None, body=None, yes=False, mutates=None):
         "Authorization": f"Bearer {token()}",
         "Version": VERSION,
         "Accept": "application/json",
-        "User-Agent": "crm-manager-ghl-cli/0.1",
+        "User-Agent": f"crm-manager-ghl-cli/{CLI_VERSION}",
     }
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -301,6 +302,7 @@ def create_tag(args):
 
 
 def delete_tag(args):
+    require_delete_confirmation(args)
     print_json(request("DELETE", f"/locations/{location_id()}/tags/{args.id}", yes=args.yes) or {})
 
 
@@ -353,6 +355,7 @@ def update_contact(args):
 
 
 def delete_contact(args):
+    require_delete_confirmation(args)
     print_json(request("DELETE", f"/contacts/{args.id}", yes=args.yes) or {})
 
 
@@ -411,7 +414,15 @@ def update_opportunity(args):
 
 
 def delete_opportunity(args):
+    require_delete_confirmation(args)
     print_json(request("DELETE", f"/opportunities/{args.id}", yes=args.yes) or {})
+
+
+def require_delete_confirmation(args):
+    if not args.yes:
+        return
+    if args.confirm_delete != args.id:
+        fail(f"refusing delete; rerun with --confirm-delete {args.id}")
 
 
 def prompt_value(label, default):
@@ -490,6 +501,7 @@ def help_agent(args):
 Security:
 - Never print GHL_PRIVATE_INTEGRATION_TOKEN or full env.
 - Use reads first. Writes require global --yes before the command.
+- Deletes require global --yes and --confirm-delete ID.
 - Do not send outbound messages, payments, social posts, or GHL automations.
 - Prefer user-specific examples from .ghl-cli.json when present.
 
@@ -509,11 +521,13 @@ Contacts:
 - Search: ghl contacts search --query "{contact_query}" --limit 20
 - Upsert: ghl --yes contacts upsert --name "{contact_name}" --email "{contact_email}" --company "{company_name}" --tag prospect --field "Account Status=Prospect" --field "Primary Relationship=Decision Maker"
 - Update: ghl --yes contacts update CONTACT_ID --field "Account Notes=..."
+- Delete: ghl --yes contacts delete CONTACT_ID --confirm-delete CONTACT_ID
 
 Opportunities:
 - Search: ghl opportunities search --pipeline "{pipeline}" --status all --limit 100
 - Create: ghl --yes opportunities create --contact-id CONTACT_ID --name "{opportunity_name}" --pipeline "{pipeline}" --stage "Proposal Sent" --status open --value {annual_value} --field "Revenue Model=Monthly Recurring" --field "Monthly Amount={monthly_amount}" --field "Forecast Term Months=12" --field "Forecast Value Basis=First-year recurring value"
 - Update: ghl --yes opportunities update OPPORTUNITY_ID --pipeline "{pipeline}" --stage "Qualified" --value 0 --field "Next Step=Book discovery."
+- Delete: ghl --yes opportunities delete OPPORTUNITY_ID --confirm-delete OPPORTUNITY_ID
 
 Recurring value rule:
 - Monthly recurring opportunity value = expected first-year revenue.
@@ -633,6 +647,7 @@ def cleanup_audit(args):
 def build_parser():
     parser = argparse.ArgumentParser(prog="ghl")
     parser.add_argument("--yes", action="store_true", help="execute writes; otherwise writes are dry-run")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {CLI_VERSION}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     help_cmd = sub.add_parser("help")
@@ -667,6 +682,7 @@ def build_parser():
     tag_create.set_defaults(func=create_tag)
     tag_delete = tags_sub.add_parser("delete")
     tag_delete.add_argument("id")
+    tag_delete.add_argument("--confirm-delete", help="required with --yes; must equal id")
     tag_delete.set_defaults(func=delete_tag)
 
     contacts = sub.add_parser("contacts")
@@ -695,6 +711,7 @@ def build_parser():
     contact_update.set_defaults(func=update_contact)
     contact_delete = contacts_sub.add_parser("delete")
     contact_delete.add_argument("id")
+    contact_delete.add_argument("--confirm-delete", help="required with --yes; must equal id")
     contact_delete.set_defaults(func=delete_contact)
 
     opps = sub.add_parser("opportunities")
@@ -725,6 +742,7 @@ def build_parser():
     opp_update.set_defaults(func=update_opportunity)
     opp_delete = opps_sub.add_parser("delete")
     opp_delete.add_argument("id")
+    opp_delete.add_argument("--confirm-delete", help="required with --yes; must equal id")
     opp_delete.set_defaults(func=delete_opportunity)
 
     cleanup = sub.add_parser("cleanup")

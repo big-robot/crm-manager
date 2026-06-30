@@ -18,6 +18,24 @@ See `AGENTS.md` for agent-specific safety rules and recipes.
 If the CLI is not installed on `PATH`, run commands from the repo root with
 `./bin/ghl`.
 
+## Installation
+
+Clone the repo and optionally put `ghl` on your `PATH`:
+
+```sh
+git clone https://github.com/big-robot/crm-manager.git
+cd crm-manager
+./bin/ghl --version
+./bin/ghl --help
+```
+
+Optional symlink:
+
+```sh
+ln -s "$PWD/bin/ghl" /usr/local/bin/ghl
+ghl --version
+```
+
 ## Initialization
 
 Create local config and env placeholders:
@@ -115,7 +133,7 @@ Notes:
 - After changing permissions or rotating the token, run:
 
 ```sh
-bin/ghl doctor
+ghl doctor
 ```
 
 Read commands:
@@ -137,4 +155,19 @@ Write commands are dry-run by default. Add `--yes` before the command to execute
 ghl --yes contacts upsert --name "Example Person" --email "person@example.com" --tag prospect
 ```
 
+Deletes require an extra confirmation matching the record id:
+
+```sh
+ghl --yes contacts delete CONTACT_ID --confirm-delete CONTACT_ID
+ghl --yes opportunities delete OPPORTUNITY_ID --confirm-delete OPPORTUNITY_ID
+```
+
 Do not add outbound messaging, payment, or social-posting commands to this CLI.
+
+## Local Tests
+
+Run the local smoke tests:
+
+```sh
+python3 -m unittest discover -s tests
+```

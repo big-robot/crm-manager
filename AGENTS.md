@@ -9,6 +9,7 @@ Security first.
 - The CLI automatically reads a repo-root `.env` file; never print its contents.
 - Reads do not need `--yes`.
 - Writes are dry-run unless `--yes` appears before the command, e.g. `ghl --yes opportunities update ...`.
+- Deletes require both `--yes` and `--confirm-delete ID`.
 - Do not add or run outbound email, SMS, social posting, payment, or GHL automation actions from this CLI without explicit user approval.
 
 ## Setup
@@ -73,6 +74,18 @@ Update:
 
 ```sh
 ghl --yes opportunities update OPPORTUNITY_ID --pipeline "Sales Pipeline" --stage "Qualified" --value 0 --field "Next Step=Book discovery."
+```
+
+Delete:
+
+```sh
+ghl --yes opportunities delete OPPORTUNITY_ID --confirm-delete OPPORTUNITY_ID
+```
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests
 ```
 
 ## Valuation Rule
