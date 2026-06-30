@@ -1,0 +1,14 @@
+tmp/
+docs/
+backups/
+node_modules/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+.ghl-cli.json
+ghl-cli.json
+.DS_Store
+.idea/
+.vscode/

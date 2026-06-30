@@ -1,0 +1,28 @@
+{
+  "defaultPipeline": "Sales Pipeline",
+  "canonicalStages": [
+    "New Lead",
+    "Engaged",
+    "Qualified",
+    "Meeting Booked",
+    "Discovery Complete",
+    "Proposal Sent",
+    "Nurture"
+  ],
+  "canonicalTags": [
+    "client",
+    "prospect",
+    "partner",
+    "do-not-contact",
+    "needs-cleanup"
+  ],
+  "examples": {
+    "companyName": "Example Co",
+    "contactName": "Jane Doe",
+    "contactEmail": "jane@example.com",
+    "contactSearch": "Example Co",
+    "opportunityName": "Example Co - Managed Service",
+    "monthlyAmount": 1500,
+    "annualValue": 18000
+  }
+}

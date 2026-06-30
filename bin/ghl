@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+BASE_URL = "https://services.leadconnectorhq.com"
+VERSION = "2021-07-28"
+WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+GENERIC_DEFAULT_PIPELINE = "Sales Pipeline"
+GENERIC_CANONICAL_STAGES = [
+    "New Lead",
+    "Engaged",
+    "Qualified",
+    "Meeting Booked",
+    "Discovery Complete",
+    "Proposal Sent",
+    "Nurture",
+]
+GENERIC_CANONICAL_TAGS = ["client", "prospect", "partner", "do-not-contact", "needs-cleanup"]
+CONFIG_FILENAMES = (".ghl-cli.json", "ghl-cli.json")
+_CONFIG = None
+_DOTENV = None
+
+
+def fail(message, code=1):
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def candidate_roots():
+    roots = []
+    for base in [Path.cwd(), Path(__file__).resolve().parent.parent]:
+        for current in [base, *base.parents]:
+            if current not in roots:
+                roots.append(current)
+    return roots
+
+
+def find_dotenv_path():
+    explicit = os.environ.get("GHL_ENV_FILE")
+    if explicit:
+        path = Path(explicit).expanduser()
+        return path if path.exists() else None
+
+    for root in candidate_roots():
+        path = root / ".env"
+        if path.exists():
+            return path
+    return None
+
+
+def parse_dotenv_line(line):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export "):
+        line = line[len("export "):].strip()
+    if "=" not in line:
+        return None
+    key, value = line.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key:
+        return None
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        value = value[1:-1]
+    return key, value
+
+
+def dotenv_values():
+    global _DOTENV
+    if _DOTENV is not None:
+        return _DOTENV
+
+    path = find_dotenv_path()
+    if not path:
+        _DOTENV = {}
+        return _DOTENV
+
+    values = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            parsed = parse_dotenv_line(line)
+            if parsed:
+                key, value = parsed
+                values[key] = value
+    except OSError as exc:
+        fail(f"could not read env file {path}: {exc}")
+    _DOTENV = values
+    return _DOTENV
+
+
+def env(name):
+    value = os.environ.get(name) or dotenv_values().get(name)
+    if not value:
+        fail(f"missing {name}")
+    return value
+
+
+def location_id():
+    return env("GHL_LOCATION_ID")
+
+
+def token():
+    return env("GHL_PRIVATE_INTEGRATION_TOKEN")
+
+
+def print_json(value):
+    print(json.dumps(value, indent=2, sort_keys=False))
+
+
+def find_config_path():
+    explicit = os.environ.get("GHL_CLI_CONFIG")
+    if explicit:
+        path = Path(explicit).expanduser()
+        return path if path.exists() else None
+
+    for current in candidate_roots():
+        for filename in CONFIG_FILENAMES:
+            path = current / filename
+            if path.exists():
+                return path
+    return None
+
+
+def load_config():
+    global _CONFIG
+    if _CONFIG is not None:
+        return _CONFIG
+
+    path = find_config_path()
+    if not path:
+        _CONFIG = {}
+        return _CONFIG
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            _CONFIG = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"could not read config {path}: {exc}")
+    return _CONFIG
+
+
+def default_pipeline_name():
+    return os.environ.get("GHL_DEFAULT_PIPELINE") or load_config().get("defaultPipeline") or GENERIC_DEFAULT_PIPELINE
+
+
+def canonical_stages():
+    return load_config().get("canonicalStages") or GENERIC_CANONICAL_STAGES
+
+
+def canonical_tags():
+    return load_config().get("canonicalTags") or GENERIC_CANONICAL_TAGS
+
+
+def example_config():
+    return load_config().get("examples") or {}
+
+
+def env_present(name):
+    return bool(os.environ.get(name) or dotenv_values().get(name))
+
+
+def request(method, path, *, query=None, body=None, yes=False, mutates=None):
+    method = method.upper()
+    if mutates is None:
+        mutates = method in WRITE_METHODS
+    query = query or {}
+    body = body or None
+    url = f"{BASE_URL}{path}"
+    if query:
+        url = f"{url}?{urllib.parse.urlencode(query, doseq=True)}"
+
+    if mutates and not yes:
+        return {
+            "dryRun": True,
+            "method": method,
+            "url": url,
+            "body": body,
+            "message": "Re-run with --yes to execute.",
+        }
+
+    data = None
+    headers = {
+        "Authorization": f"Bearer {token()}",
+        "Version": VERSION,
+        "Accept": "application/json",
+        "User-Agent": "crm-manager-ghl-cli/0.1",
+    }
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode("utf-8")
+            if not raw:
+                return {}
+            return json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        fail(f"HTTP {exc.code}: {raw}")
+    except urllib.error.URLError as exc:
+        fail(str(exc))
+
+
+def parse_kv(values):
+    result = {}
+    for item in values or []:
+        if "=" not in item:
+            fail(f"expected NAME=VALUE, got {item!r}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            fail(f"empty field name in {item!r}")
+        result[key] = value
+    return result
+
+
+def pipelines():
+    data = request("GET", "/opportunities/pipelines", query={"locationId": location_id()})
+    return data.get("pipelines", [])
+
+
+def find_pipeline(name):
+    for pipeline in pipelines():
+        if pipeline.get("name") == name:
+            return pipeline
+    fail(f"pipeline not found: {name}")
+
+
+def find_stage(pipeline, name):
+    for stage in pipeline.get("stages", []):
+        if stage.get("name") == name:
+            return stage
+    fail(f"stage not found in {pipeline.get('name')}: {name}")
+
+
+def custom_fields(model):
+    data = request("GET", f"/locations/{location_id()}/customFields", query={"model": model})
+    return data.get("customFields", [])
+
+
+def field_map(model):
+    return {field.get("name"): field for field in custom_fields(model)}
+
+
+def custom_field_payload(model, field_values):
+    fields = field_map(model)
+    payload = []
+    for name, value in field_values.items():
+        field = fields.get(name)
+        if not field:
+            fail(f"{model} custom field not found: {name}")
+        if field.get("dataType") == "MULTIPLE_OPTIONS" and isinstance(value, str):
+            value = [part.strip() for part in value.split(",") if part.strip()]
+        payload.append({"id": field["id"], "field_value": value})
+    return payload
+
+
+def summarize_pipelines(args):
+    rows = []
+    for pipeline in pipelines():
+        rows.append({
+            "id": pipeline.get("id"),
+            "name": pipeline.get("name"),
+            "stages": [stage.get("name") for stage in pipeline.get("stages", [])],
+        })
+    print_json(rows)
+
+
+def summarize_fields(args):
+    rows = []
+    for field in custom_fields(args.model):
+        rows.append({
+            "id": field.get("id"),
+            "name": field.get("name"),
+            "model": field.get("model"),
+            "dataType": field.get("dataType"),
+            "fieldKey": field.get("fieldKey"),
+            "options": field.get("picklistOptions") or field.get("options"),
+        })
+    print_json(rows)
+
+
+def list_tags(args):
+    data = request("GET", f"/locations/{location_id()}/tags")
+    print_json(data.get("tags", data))
+
+
+def create_tag(args):
+    print_json(request("POST", f"/locations/{location_id()}/tags/", body={"name": args.name}, yes=args.yes) or {})
+
+
+def delete_tag(args):
+    print_json(request("DELETE", f"/locations/{location_id()}/tags/{args.id}", yes=args.yes) or {})
+
+
+def search_contacts(args):
+    body = {
+        "locationId": location_id(),
+        "page": args.page,
+        "pageLimit": args.limit,
+    }
+    if args.query:
+        body["query"] = args.query
+    data = request("POST", "/contacts/search", body=body, mutates=False)
+    print_json(data)
+
+
+def upsert_contact(args):
+    body = {
+        "locationId": location_id(),
+        "name": args.name,
+        "email": args.email,
+        "phone": args.phone,
+        "companyName": args.company,
+        "tags": args.tag or None,
+    }
+    fields = parse_kv(args.field)
+    if fields:
+        body["customFields"] = custom_field_payload("contact", fields)
+    body = {key: value for key, value in body.items() if value not in (None, "", [])}
+    print_json(request("POST", "/contacts/upsert", body=body, yes=args.yes) or {})
+
+
+def update_contact(args):
+    body = {}
+    if args.name:
+        body["name"] = args.name
+    if args.email:
+        body["email"] = args.email
+    if args.phone:
+        body["phone"] = args.phone
+    if args.company:
+        body["companyName"] = args.company
+    if args.tag:
+        body["tags"] = args.tag
+    fields = parse_kv(args.field)
+    if fields:
+        body["customFields"] = custom_field_payload("contact", fields)
+    if not body:
+        fail("nothing to update")
+    print_json(request("PUT", f"/contacts/{args.id}", body=body, yes=args.yes) or {})
+
+
+def delete_contact(args):
+    print_json(request("DELETE", f"/contacts/{args.id}", yes=args.yes) or {})
+
+
+def search_opportunities(args):
+    query = {
+        "location_id": location_id(),
+        "limit": args.limit,
+        "status": args.status,
+    }
+    if args.query:
+        query["q"] = args.query
+    if args.pipeline:
+        query["pipeline_id"] = find_pipeline(args.pipeline)["id"]
+    data = request("GET", "/opportunities/search", query=query)
+    print_json(data)
+
+
+def create_opportunity(args):
+    pipeline = find_pipeline(args.pipeline)
+    stage = find_stage(pipeline, args.stage)
+    body = {
+        "locationId": location_id(),
+        "contactId": args.contact_id,
+        "pipelineId": pipeline["id"],
+        "pipelineStageId": stage["id"],
+        "name": args.name,
+        "status": args.status,
+    }
+    if args.value is not None:
+        body["monetaryValue"] = args.value
+    fields = parse_kv(args.field)
+    if fields:
+        body["customFields"] = custom_field_payload("opportunity", fields)
+    print_json(request("POST", "/opportunities/", body=body, yes=args.yes) or {})
+
+
+def update_opportunity(args):
+    body = {}
+    if args.name:
+        body["name"] = args.name
+    if args.status:
+        body["status"] = args.status
+    if args.value is not None:
+        body["monetaryValue"] = args.value
+    if args.pipeline or args.stage:
+        pipeline = find_pipeline(args.pipeline or default_pipeline_name())
+        body["pipelineId"] = pipeline["id"]
+        if args.stage:
+            body["pipelineStageId"] = find_stage(pipeline, args.stage)["id"]
+    fields = parse_kv(args.field)
+    if fields:
+        body["customFields"] = custom_field_payload("opportunity", fields)
+    if not body:
+        fail("nothing to update")
+    print_json(request("PUT", f"/opportunities/{args.id}", body=body, yes=args.yes) or {})
+
+
+def delete_opportunity(args):
+    print_json(request("DELETE", f"/opportunities/{args.id}", yes=args.yes) or {})
+
+
+def prompt_value(label, default):
+    if not sys.stdin.isatty():
+        return default
+    suffix = f" [{default}]" if default else ""
+    value = input(f"{label}{suffix}: ").strip()
+    return value or default
+
+
+def split_csv(value):
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def init_cli(args):
+    target = Path(args.config).expanduser()
+
+    pipeline = args.default_pipeline or prompt_value("Default pipeline name", GENERIC_DEFAULT_PIPELINE)
+    stages = split_csv(args.stages or prompt_value("Pipeline stages", ", ".join(GENERIC_CANONICAL_STAGES)))
+    tags = split_csv(args.tags or prompt_value("Canonical tags", ", ".join(GENERIC_CANONICAL_TAGS)))
+    company_name = args.example_company or prompt_value("Example company name", "Example Co")
+    contact_name = args.example_contact or prompt_value("Example contact name", "Jane Doe")
+    contact_email = args.example_email or prompt_value("Example contact email", "jane@example.com")
+    opportunity_name = args.example_opportunity or prompt_value(
+        "Example opportunity name",
+        f"{company_name} - Managed Service",
+    )
+
+    if target.exists() and not args.force:
+        fail(f"{target} already exists; use --force to overwrite")
+
+    config = {
+        "defaultPipeline": pipeline,
+        "canonicalStages": stages,
+        "canonicalTags": tags,
+        "examples": {
+            "companyName": company_name,
+            "contactName": contact_name,
+            "contactEmail": contact_email,
+            "contactSearch": company_name,
+            "opportunityName": opportunity_name,
+            "monthlyAmount": 1500,
+            "annualValue": 18000,
+        },
+    }
+
+    target.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    next_steps = [
+        "Create a GHL private integration token with the README permissions.",
+    ]
+    if not find_dotenv_path():
+        next_steps.append("Copy .env.example to .env and set GHL_LOCATION_ID and GHL_PRIVATE_INTEGRATION_TOKEN securely.")
+    else:
+        next_steps.append("Run ghl doctor to verify the repo-root .env and API permissions.")
+    next_steps.append("Run ghl help agent.")
+
+    print_json({
+        "created": [str(target)],
+        "envFile": str(find_dotenv_path()) if find_dotenv_path() else None,
+        "next": next_steps,
+    })
+
+
+def help_agent(args):
+    pipeline = default_pipeline_name()
+    examples = example_config()
+    contact_name = examples.get("contactName", "Jane Doe")
+    contact_email = examples.get("contactEmail", "jane@example.com")
+    company_name = examples.get("companyName", "Example Co")
+    contact_query = examples.get("contactSearch", company_name)
+    opportunity_name = examples.get("opportunityName", f"{company_name} - Managed Service")
+    monthly_amount = examples.get("monthlyAmount", 1500)
+    annual_value = examples.get("annualValue", int(monthly_amount) * 12 if isinstance(monthly_amount, int) else 18000)
+    print(f"""GHL CLI agent cheat sheet
+
+Security:
+- Never print GHL_PRIVATE_INTEGRATION_TOKEN or full env.
+- Use reads first. Writes require global --yes before the command.
+- Do not send outbound messages, payments, social posts, or GHL automations.
+- Prefer user-specific examples from .ghl-cli.json when present.
+
+First commands:
+- ghl doctor
+- ghl pipelines
+- ghl fields --model opportunity
+- ghl contacts search --query "Company or person"
+- ghl opportunities search --pipeline "{pipeline}" --status all --limit 100
+
+Write flag:
+- Dry run: ghl contacts upsert --name "{contact_name}" --email "{contact_email}"
+- Execute: ghl --yes contacts upsert --name "{contact_name}" --email "{contact_email}"
+- --yes is global and must appear before contacts/opportunities/tags.
+
+Contacts:
+- Search: ghl contacts search --query "{contact_query}" --limit 20
+- Upsert: ghl --yes contacts upsert --name "{contact_name}" --email "{contact_email}" --company "{company_name}" --tag prospect --field "Account Status=Prospect" --field "Primary Relationship=Decision Maker"
+- Update: ghl --yes contacts update CONTACT_ID --field "Account Notes=..."
+
+Opportunities:
+- Search: ghl opportunities search --pipeline "{pipeline}" --status all --limit 100
+- Create: ghl --yes opportunities create --contact-id CONTACT_ID --name "{opportunity_name}" --pipeline "{pipeline}" --stage "Proposal Sent" --status open --value {annual_value} --field "Revenue Model=Monthly Recurring" --field "Monthly Amount={monthly_amount}" --field "Forecast Term Months=12" --field "Forecast Value Basis=First-year recurring value"
+- Update: ghl --yes opportunities update OPPORTUNITY_ID --pipeline "{pipeline}" --stage "Qualified" --value 0 --field "Next Step=Book discovery."
+
+Recurring value rule:
+- Monthly recurring opportunity value = expected first-year revenue.
+- Store monthly price in Monthly Amount.
+- Set Forecast Term Months=12 and Forecast Value Basis=First-year recurring value.
+- One-time proposals use exact proposal total.
+- Unpriced discovery items stay value 0 with Revenue Model=TBD.
+
+Configured pipeline:
+- {pipeline}: {", ".join(canonical_stages())}
+""")
+
+
+def doctor(args):
+    default_pipeline = default_pipeline_name()
+    config_path = find_config_path()
+    result = {
+        "env": {
+            "GHL_LOCATION_ID": "present" if env_present("GHL_LOCATION_ID") else "missing",
+            "GHL_PRIVATE_INTEGRATION_TOKEN": "present" if env_present("GHL_PRIVATE_INTEGRATION_TOKEN") else "missing",
+        },
+        "api": {
+            "reachable": False,
+            "error": None,
+        },
+        "crm": {
+            "configPath": str(config_path) if config_path else None,
+            "defaultPipeline": default_pipeline,
+        },
+        "next": None,
+    }
+
+    if not env_present("GHL_LOCATION_ID") or not env_present("GHL_PRIVATE_INTEGRATION_TOKEN"):
+        result["next"] = "Set missing env vars. Do not print token values."
+        print_json(result)
+        return
+
+    try:
+        pipe_rows = pipelines()
+        tags = request("GET", f"/locations/{location_id()}/tags").get("tags", [])
+        contact_fields = custom_fields("contact")
+        opportunity_fields = custom_fields("opportunity")
+    except SystemExit as exc:
+        result["api"]["error"] = f"GHL request failed with exit code {exc.code}"
+        result["next"] = "Check token scopes, token freshness, and location id."
+        print_json(result)
+        return
+
+    default_pipeline_record = next((pipe for pipe in pipe_rows if pipe.get("name") == default_pipeline), None)
+    tag_names = {tag.get("name") for tag in tags if isinstance(tag, dict)}
+    result["api"]["reachable"] = True
+    result["crm"] = {
+        "configPath": str(config_path) if config_path else None,
+        "defaultPipelinePresent": bool(default_pipeline_record),
+        "defaultPipeline": default_pipeline,
+        "stages": [stage.get("name") for stage in (default_pipeline_record or {}).get("stages", [])],
+        "tagCount": len(tags),
+        "canonicalTagsPresent": sorted(
+            set(canonical_tags()) & tag_names
+        ),
+        "contactFieldNames": sorted(field.get("name") for field in contact_fields if field.get("name")),
+        "opportunityFieldNames": sorted(field.get("name") for field in opportunity_fields if field.get("name")),
+    }
+    result["next"] = "Use bin/ghl help agent for command recipes."
+    print_json(result)
+
+
+def cleanup_audit(args):
+    default_pipeline = default_pipeline_name()
+    expected_stages = canonical_stages()
+    expected_tags = set(canonical_tags())
+    pipe_rows = pipelines()
+    tags = request("GET", f"/locations/{location_id()}/tags").get("tags", [])
+    tag_names = {tag.get("name") for tag in tags if isinstance(tag, dict)}
+    default_pipeline_record = next((pipe for pipe in pipe_rows if pipe.get("name") == default_pipeline), None)
+    legacy = [pipe.get("name") for pipe in pipe_rows if pipe.get("name") != default_pipeline]
+    disposable_contacts = request("POST", "/contacts/search", body={
+        "locationId": location_id(),
+        "page": 1,
+        "pageLimit": 20,
+        "query": "Codex",
+    }, mutates=False)
+    disposable_opps = request("GET", "/opportunities/search", query={
+        "location_id": location_id(),
+        "limit": 20,
+        "status": "all",
+        "q": "Codex",
+    })
+    result = {
+        "pipeline": {
+            "defaultPipeline": default_pipeline,
+            "defaultPipelinePresent": bool(default_pipeline_record),
+            "defaultPipelineStages": [stage.get("name") for stage in (default_pipeline_record or {}).get("stages", [])],
+            "stageMismatch": bool(default_pipeline_record) and [stage.get("name") for stage in default_pipeline_record.get("stages", [])] != expected_stages,
+            "legacyPipelinesPresent": legacy,
+        },
+        "tags": {
+            "canonicalMissing": sorted(expected_tags - tag_names),
+            "nonCanonicalCount": len(tag_names - expected_tags),
+            "nonCanonicalSample": sorted(tag_names - expected_tags)[:50],
+        },
+        "disposableTestRecords": {
+            "contacts": [
+                {"id": c.get("id"), "name": c.get("contactName") or c.get("name"), "email": c.get("email")}
+                for c in disposable_contacts.get("contacts", [])
+            ],
+            "opportunities": [
+                {"id": o.get("id"), "name": o.get("name"), "status": o.get("status")}
+                for o in disposable_opps.get("opportunities", [])
+            ],
+        },
+        "next": "Review only. This command does not delete or mutate cleanup targets.",
+    }
+    print_json(result)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="ghl")
+    parser.add_argument("--yes", action="store_true", help="execute writes; otherwise writes are dry-run")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    help_cmd = sub.add_parser("help")
+    help_sub = help_cmd.add_subparsers(dest="help_command", required=True)
+    help_sub.add_parser("agent").set_defaults(func=help_agent)
+
+    init = sub.add_parser("init")
+    init.add_argument("--config", default=".ghl-cli.json")
+    init.add_argument("--default-pipeline")
+    init.add_argument("--stages", help="comma-separated stage names")
+    init.add_argument("--tags", help="comma-separated tag names")
+    init.add_argument("--example-company")
+    init.add_argument("--example-contact")
+    init.add_argument("--example-email")
+    init.add_argument("--example-opportunity")
+    init.add_argument("--force", action="store_true")
+    init.set_defaults(func=init_cli)
+
+    sub.add_parser("doctor").set_defaults(func=doctor)
+
+    sub.add_parser("pipelines").set_defaults(func=summarize_pipelines)
+
+    fields = sub.add_parser("fields")
+    fields.add_argument("--model", choices=["all", "contact", "opportunity"], default="all")
+    fields.set_defaults(func=summarize_fields)
+
+    tags = sub.add_parser("tags")
+    tags_sub = tags.add_subparsers(dest="tags_command", required=True)
+    tags_sub.add_parser("list").set_defaults(func=list_tags)
+    tag_create = tags_sub.add_parser("create")
+    tag_create.add_argument("name")
+    tag_create.set_defaults(func=create_tag)
+    tag_delete = tags_sub.add_parser("delete")
+    tag_delete.add_argument("id")
+    tag_delete.set_defaults(func=delete_tag)
+
+    contacts = sub.add_parser("contacts")
+    contacts_sub = contacts.add_subparsers(dest="contacts_command", required=True)
+    contact_search = contacts_sub.add_parser("search")
+    contact_search.add_argument("--query")
+    contact_search.add_argument("--limit", type=int, default=20)
+    contact_search.add_argument("--page", type=int, default=1)
+    contact_search.set_defaults(func=search_contacts)
+    contact_upsert = contacts_sub.add_parser("upsert")
+    contact_upsert.add_argument("--name")
+    contact_upsert.add_argument("--email")
+    contact_upsert.add_argument("--phone")
+    contact_upsert.add_argument("--company")
+    contact_upsert.add_argument("--tag", action="append")
+    contact_upsert.add_argument("--field", action="append", help="custom field as NAME=VALUE")
+    contact_upsert.set_defaults(func=upsert_contact)
+    contact_update = contacts_sub.add_parser("update")
+    contact_update.add_argument("id")
+    contact_update.add_argument("--name")
+    contact_update.add_argument("--email")
+    contact_update.add_argument("--phone")
+    contact_update.add_argument("--company")
+    contact_update.add_argument("--tag", action="append")
+    contact_update.add_argument("--field", action="append", help="custom field as NAME=VALUE")
+    contact_update.set_defaults(func=update_contact)
+    contact_delete = contacts_sub.add_parser("delete")
+    contact_delete.add_argument("id")
+    contact_delete.set_defaults(func=delete_contact)
+
+    opps = sub.add_parser("opportunities")
+    opps_sub = opps.add_subparsers(dest="opportunities_command", required=True)
+    opp_search = opps_sub.add_parser("search")
+    opp_search.add_argument("--query")
+    opp_search.add_argument("--pipeline")
+    opp_search.add_argument("--status", choices=["open", "won", "lost", "abandoned", "all"], default="all")
+    opp_search.add_argument("--limit", type=int, default=20)
+    opp_search.set_defaults(func=search_opportunities)
+    opp_create = opps_sub.add_parser("create")
+    opp_create.add_argument("--contact-id", required=True)
+    opp_create.add_argument("--name", required=True)
+    opp_create.add_argument("--pipeline", default=default_pipeline_name())
+    opp_create.add_argument("--stage", required=True)
+    opp_create.add_argument("--status", choices=["open", "won", "lost", "abandoned"], default="open")
+    opp_create.add_argument("--value", type=float)
+    opp_create.add_argument("--field", action="append", help="custom field as NAME=VALUE")
+    opp_create.set_defaults(func=create_opportunity)
+    opp_update = opps_sub.add_parser("update")
+    opp_update.add_argument("id")
+    opp_update.add_argument("--name")
+    opp_update.add_argument("--pipeline")
+    opp_update.add_argument("--stage")
+    opp_update.add_argument("--status", choices=["open", "won", "lost", "abandoned"])
+    opp_update.add_argument("--value", type=float)
+    opp_update.add_argument("--field", action="append", help="custom field as NAME=VALUE")
+    opp_update.set_defaults(func=update_opportunity)
+    opp_delete = opps_sub.add_parser("delete")
+    opp_delete.add_argument("id")
+    opp_delete.set_defaults(func=delete_opportunity)
+
+    cleanup = sub.add_parser("cleanup")
+    cleanup_sub = cleanup.add_subparsers(dest="cleanup_command", required=True)
+    cleanup_sub.add_parser("audit").set_defaults(func=cleanup_audit)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

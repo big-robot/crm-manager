@@ -1,0 +1,4 @@
+interface:
+  display_name: "GHL CLI Init"
+  short_description: "Initialize reusable GoHighLevel CLI config for agents."
+  default_prompt: "Initialize this GHL CLI package for my GoHighLevel account."
