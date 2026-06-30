@@ -1,6 +1,6 @@
 # CRM Manager
 
-Reusable GoHighLevel CRM CLI for agents and operators.
+Reusable GoHighLevel CRM CLI for agents serving their rainmaker operators.
 
 ## CLI
 
