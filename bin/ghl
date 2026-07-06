@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -11,6 +12,7 @@ import urllib.request
 
 BASE_URL = "https://services.leadconnectorhq.com"
 VERSION = "2021-07-28"
+CONVERSATIONS_VERSION = "2021-04-15"
 CLI_VERSION = "0.1.0"
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 GENERIC_DEFAULT_PIPELINE = "Sales Pipeline"
@@ -168,7 +170,7 @@ def env_present(name):
     return bool(os.environ.get(name) or dotenv_values().get(name))
 
 
-def request(method, path, *, query=None, body=None, yes=False, mutates=None):
+def request(method, path, *, query=None, body=None, yes=False, mutates=None, version=None):
     method = method.upper()
     if mutates is None:
         mutates = method in WRITE_METHODS
@@ -190,7 +192,7 @@ def request(method, path, *, query=None, body=None, yes=False, mutates=None):
     data = None
     headers = {
         "Authorization": f"Bearer {token()}",
-        "Version": VERSION,
+        "Version": version or VERSION,
         "Accept": "application/json",
         "User-Agent": f"crm-manager-ghl-cli/{CLI_VERSION}",
     }
@@ -413,9 +415,55 @@ def update_opportunity(args):
     print_json(request("PUT", f"/opportunities/{args.id}", body=body, yes=args.yes) or {})
 
 
+def next_step_opportunity(args):
+    if not args.step and not args.date:
+        fail("nothing to update; provide --step and/or --date")
+    if args.date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
+        fail(f"expected --date as YYYY-MM-DD, got {args.date!r}")
+    fields = {}
+    if args.step:
+        fields["Next Step"] = args.step
+    if args.date:
+        fields["Next Step Date"] = args.date
+    body = {"customFields": custom_field_payload("opportunity", fields)}
+    print_json(request("PUT", f"/opportunities/{args.id}", body=body, yes=args.yes) or {})
+
+
 def delete_opportunity(args):
     require_delete_confirmation(args)
     print_json(request("DELETE", f"/opportunities/{args.id}", yes=args.yes) or {})
+
+
+def search_conversations(args):
+    query = {
+        "locationId": location_id(),
+        "limit": args.limit,
+    }
+    if args.contact_id:
+        query["contactId"] = args.contact_id
+    if args.query:
+        query["query"] = args.query
+    data = request("GET", "/conversations/search", query=query, version=CONVERSATIONS_VERSION)
+    print_json(data)
+
+
+def conversation_messages(args):
+    data = request(
+        "GET",
+        f"/conversations/{args.id}/messages",
+        query={"limit": args.limit},
+        version=CONVERSATIONS_VERSION,
+    )
+    print_json(data)
+
+
+def conversation_email(args):
+    data = request(
+        "GET",
+        f"/conversations/messages/email/{args.id}",
+        version=CONVERSATIONS_VERSION,
+    )
+    print_json(data)
 
 
 def require_delete_confirmation(args):
@@ -527,7 +575,15 @@ Opportunities:
 - Search: ghl opportunities search --pipeline "{pipeline}" --status all --limit 100
 - Create: ghl --yes opportunities create --contact-id CONTACT_ID --name "{opportunity_name}" --pipeline "{pipeline}" --stage "Proposal Sent" --status open --value {annual_value} --field "Revenue Model=Monthly Recurring" --field "Monthly Amount={monthly_amount}" --field "Forecast Term Months=12" --field "Forecast Value Basis=First-year recurring value"
 - Update: ghl --yes opportunities update OPPORTUNITY_ID --pipeline "{pipeline}" --stage "Qualified" --value 0 --field "Next Step=Book discovery."
+- Next-step hygiene (only fields it can touch): ghl --yes opportunities next-step OPPORTUNITY_ID --step "Follow up after install." --date 2026-07-10
 - Delete: ghl --yes opportunities delete OPPORTUNITY_ID --confirm-delete OPPORTUNITY_ID
+
+Conversations (read-only):
+- Search by contact: ghl conversations search --contact-id CONTACT_ID
+- Search by text: ghl conversations search --query "{contact_query}" --limit 20
+- Thread messages: ghl conversations messages CONVERSATION_ID --limit 50
+- Full email body: ghl conversations email EMAIL_MESSAGE_ID
+- Conversations are read-only in this CLI: no send, reply, update, or delete exists, by policy.
 
 Recurring value rule:
 - Monthly recurring opportunity value = expected first-year revenue.
@@ -740,10 +796,32 @@ def build_parser():
     opp_update.add_argument("--value", type=float)
     opp_update.add_argument("--field", action="append", help="custom field as NAME=VALUE")
     opp_update.set_defaults(func=update_opportunity)
+    opp_next = opps_sub.add_parser(
+        "next-step", help="hygiene-only update of Next Step / Next Step Date"
+    )
+    opp_next.add_argument("id")
+    opp_next.add_argument("--step", help="Next Step text")
+    opp_next.add_argument("--date", help="Next Step Date as YYYY-MM-DD")
+    opp_next.set_defaults(func=next_step_opportunity)
     opp_delete = opps_sub.add_parser("delete")
     opp_delete.add_argument("id")
     opp_delete.add_argument("--confirm-delete", help="required with --yes; must equal id")
     opp_delete.set_defaults(func=delete_opportunity)
+
+    convos = sub.add_parser("conversations", help="read-only access to captured conversations")
+    convos_sub = convos.add_subparsers(dest="conversations_command", required=True)
+    convo_search = convos_sub.add_parser("search")
+    convo_search.add_argument("--contact-id")
+    convo_search.add_argument("--query")
+    convo_search.add_argument("--limit", type=int, default=20)
+    convo_search.set_defaults(func=search_conversations)
+    convo_messages = convos_sub.add_parser("messages")
+    convo_messages.add_argument("id")
+    convo_messages.add_argument("--limit", type=int, default=20)
+    convo_messages.set_defaults(func=conversation_messages)
+    convo_email = convos_sub.add_parser("email")
+    convo_email.add_argument("id")
+    convo_email.set_defaults(func=conversation_email)
 
     cleanup = sub.add_parser("cleanup")
     cleanup_sub = cleanup.add_subparsers(dest="cleanup_command", required=True)

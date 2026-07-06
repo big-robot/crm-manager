@@ -40,6 +40,7 @@ ghl fields --model opportunity
 ghl tags list
 ghl contacts search --query "Example Co" --limit 20
 ghl opportunities search --pipeline "Sales Pipeline" --status all --limit 100
+ghl conversations search --contact-id CONTACT_ID
 ```
 
 ## Contacts
@@ -76,10 +77,32 @@ Update:
 ghl --yes opportunities update OPPORTUNITY_ID --pipeline "Sales Pipeline" --stage "Qualified" --value 0 --field "Next Step=Book discovery."
 ```
 
+Next-step hygiene (constrained command — can only touch Next Step / Next Step Date;
+the sanctioned command for unattended evidence-backed updates, see the knowledge-repo
+CRM access policy):
+
+```sh
+ghl --yes opportunities next-step OPPORTUNITY_ID --step "Follow up after install." --date 2026-07-10
+```
+
 Delete:
 
 ```sh
 ghl --yes opportunities delete OPPORTUNITY_ID --confirm-delete OPPORTUNITY_ID
+```
+
+## Conversations (read-only)
+
+The email connector captures inbound and outbound customer email into GHL
+conversations. This CLI exposes them read-only; no send, reply, update, or delete
+subcommand exists, by policy. Requires `conversations.readonly` and
+`conversations/message.readonly` token scopes.
+
+```sh
+ghl conversations search --contact-id CONTACT_ID
+ghl conversations search --query "Example Co" --limit 20
+ghl conversations messages CONVERSATION_ID --limit 50
+ghl conversations email EMAIL_MESSAGE_ID
 ```
 
 ## Tests

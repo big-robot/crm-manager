@@ -101,9 +101,9 @@ Security:
 
 - Do not commit the token.
 - Do not print the token in chat, logs, shell history, or docs.
-- Prefer least privilege. Do not enable payments, conversations, email, social,
-  calendars, invoices, websites, courses, phone numbers, workflows, or AI-agent
-  permissions for this CLI.
+- Prefer least privilege. Do not enable payments, email-send, social, calendars,
+  invoices, websites, courses, phone numbers, workflows, or AI-agent permissions
+  for this CLI. Conversations permissions are read-only only.
 
 Recommended steady-state permissions:
 
@@ -117,7 +117,9 @@ Recommended steady-state permissions:
   "locations/customFields.readonly",
   "locations/customFields.write",
   "locations/tags.readonly",
-  "locations/tags.write"
+  "locations/tags.write",
+  "conversations.readonly",
+  "conversations/message.readonly"
 ]
 ```
 
@@ -126,6 +128,9 @@ Notes:
 - Enable both read and write for contacts/opportunities/tags because the CLI
   searches before it writes.
 - `pipelines.readonly` is needed to resolve pipeline and stage ids by name.
+- The conversations scopes are read-only on purpose: `ghl conversations` reads
+  connector-captured email threads and has no send/reply/update/delete. Do not
+  add `conversations/message.write`.
 - `locations/customFields.readonly` is needed to map field names to ids.
 - `locations/customFields.write` is needed for setup or repair of CRM fields.
 - Temporarily add `pipelines.write` and `pipelines.create` only when creating or
@@ -146,6 +151,8 @@ ghl fields --model opportunity
 ghl tags list
 ghl contacts search --query "Example Co"
 ghl opportunities search --pipeline "Sales Pipeline" --status all
+ghl conversations search --contact-id CONTACT_ID
+ghl conversations messages CONVERSATION_ID
 ghl cleanup audit
 ```
 

@@ -79,6 +79,77 @@ class GhlCliTests(unittest.TestCase):
         self.assertIn('"dryRun": true', result.stdout)
         self.assertIn("/contacts/contact123", result.stdout)
 
+    def test_conversations_search_is_a_read_that_needs_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli("conversations", "search", cwd=tmp, env=clean_env(tmp))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing GHL_LOCATION_ID", result.stderr)
+        self.assertNotIn("dryRun", result.stdout)
+
+    def test_conversations_messages_is_a_read_that_needs_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "conversations", "messages", "conversation123", cwd=tmp, env=clean_env(tmp)
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing GHL_PRIVATE_INTEGRATION_TOKEN", result.stderr)
+        self.assertNotIn("dryRun", result.stdout)
+
+    def test_conversations_has_no_write_subcommands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = clean_env(tmp)
+            for write_command in ["send", "create", "update", "delete", "upsert"]:
+                with self.subTest(write_command=write_command):
+                    result = self.run_cli(
+                        "--yes", "conversations", write_command, "x123", cwd=tmp, env=env
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("invalid choice", result.stderr)
+
+    def test_help_agent_includes_read_only_conversations_recipes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli("help", "agent", cwd=tmp, env=clean_env(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("conversations search", result.stdout)
+        self.assertIn("conversations messages", result.stdout)
+        self.assertIn("Conversations are read-only", result.stdout)
+
+    def test_next_step_cannot_touch_stage_status_or_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = clean_env(tmp)
+            for forbidden in ["--stage", "--status", "--value"]:
+                with self.subTest(forbidden=forbidden):
+                    result = self.run_cli(
+                        "opportunities", "next-step", "opp123", forbidden, "x",
+                        cwd=tmp, env=env,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("unrecognized arguments", result.stderr)
+
+    def test_next_step_validates_date_format_before_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "opportunities", "next-step", "opp123", "--date", "07/10/2026",
+                cwd=tmp, env=clean_env(tmp),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("YYYY-MM-DD", result.stderr)
+        self.assertNotIn("missing GHL_LOCATION_ID", result.stderr)
+
+    def test_next_step_requires_step_or_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "opportunities", "next-step", "opp123", cwd=tmp, env=clean_env(tmp)
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("nothing to update", result.stderr)
+
+    def test_help_agent_includes_next_step_recipe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli("help", "agent", cwd=tmp, env=clean_env(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("opportunities next-step", result.stdout)
+
     def test_delete_requires_matching_confirmation_with_yes(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = clean_env(tmp)
