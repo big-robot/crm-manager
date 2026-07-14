@@ -94,7 +94,7 @@ class GhlCliTests(unittest.TestCase):
         self.assertIn("missing GHL_LOCATION_ID", result.stderr)
         self.assertNotIn("dryRun", result.stdout)
 
-    def test_task_search_filter_excludes_unlinked_records(self):
+    def test_task_search_reports_unlinked_records_without_hiding_them(self):
         module = runpy.run_path(str(CLI))
         filter_result = module["filter_task_search_result"]
         data = {
@@ -109,18 +109,19 @@ class GhlCliTests(unittest.TestCase):
 
         self.assertEqual(
             [task["_id"] for task in result["tasks"]],
-            ["active"],
+            ["active", "orphaned", "unknown"],
         )
         self.assertEqual(result["unlinkedTaskCount"], 2)
 
-    def test_task_search_can_include_unlinked_records_for_audit(self):
+    def test_task_search_can_exclude_unlinked_records(self):
         module = runpy.run_path(str(CLI))
         filter_result = module["filter_task_search_result"]
         data = {"tasks": [{"_id": "orphaned", "contactId": None}]}
 
-        result = filter_result(data, include_unlinked=True)
+        result = filter_result(data, exclude_unlinked=True)
 
-        self.assertEqual(result, data)
+        self.assertEqual(result["tasks"], [])
+        self.assertEqual(result["unlinkedTaskCount"], 1)
 
     def test_tasks_create_defaults_to_guarded_dry_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -219,13 +220,24 @@ class GhlCliTests(unittest.TestCase):
             result.stdout,
         )
 
-    def test_tasks_completion_is_not_exposed(self):
+    def test_tasks_complete_defaults_to_guarded_dry_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = self.run_cli(
-                "--yes", "tasks", "complete", "x123", cwd=tmp, env=clean_env(tmp)
+                "tasks",
+                "complete",
+                "task123",
+                "--contact-id",
+                "contact123",
+                cwd=tmp,
+                env=clean_env(tmp),
             )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid choice", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"dryRun": true', result.stdout)
+        self.assertIn(
+            '"url": "https://services.leadconnectorhq.com/contacts/contact123/tasks/task123/completed"',
+            result.stdout,
+        )
+        self.assertIn('"completed": true', result.stdout)
 
     def test_conversations_messages_is_a_read_that_needs_env(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,8 +273,8 @@ class GhlCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("tasks search --limit 100", result.stdout)
         self.assertIn("tasks create", result.stdout)
+        self.assertIn("tasks complete", result.stdout)
         self.assertIn("tasks delete", result.stdout)
-        self.assertIn("Complete is not exposed", result.stdout)
 
     def test_next_step_cannot_touch_stage_status_or_value(self):
         with tempfile.TemporaryDirectory() as tmp:

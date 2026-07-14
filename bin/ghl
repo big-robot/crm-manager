@@ -436,17 +436,14 @@ def delete_opportunity(args):
     print_json(request("DELETE", f"/opportunities/{args.id}", yes=args.yes) or {})
 
 
-def filter_task_search_result(data, include_unlinked=False):
+def filter_task_search_result(data, exclude_unlinked=False):
     tasks = data.get("tasks")
-    if isinstance(tasks, list) and not include_unlinked:
+    if isinstance(tasks, list):
         unlinked = [task for task in tasks if not task.get("contactId")]
-        data["tasks"] = [
-            task
-            for task in tasks
-            if task.get("contactId")
-        ]
         if unlinked:
             data["unlinkedTaskCount"] = len(unlinked)
+        if exclude_unlinked:
+            data["tasks"] = [task for task in tasks if task.get("contactId")]
     return data
 
 
@@ -458,7 +455,7 @@ def search_tasks(args):
         mutates=False,
         version=TASKS_VERSION,
     )
-    data = filter_task_search_result(data, include_unlinked=args.include_unlinked)
+    data = filter_task_search_result(data, exclude_unlinked=args.exclude_unlinked)
     print_json(data)
 
 
@@ -509,6 +506,19 @@ def update_task(args):
             "PUT",
             f"/contacts/{args.contact_id}/tasks/{args.id}",
             body=body,
+            yes=args.yes,
+            version=TASKS_VERSION,
+        )
+        or {}
+    )
+
+
+def complete_task(args):
+    print_json(
+        request(
+            "PUT",
+            f"/contacts/{args.contact_id}/tasks/{args.id}/completed",
+            body={"completed": True},
             yes=args.yes,
             version=TASKS_VERSION,
         )
@@ -686,12 +696,12 @@ Opportunities:
 
 Tasks:
 - Search: ghl tasks search --limit 100
-- Audit unlinked search records: ghl tasks search --limit 100 --include-unlinked
+- Exclude unlinked search records: ghl tasks search --limit 100 --exclude-unlinked
 - Dry run: ghl tasks create --contact-id CONTACT_ID --title "Follow up" --body "Context" --due 2026-07-14T09:00:00-04:00 --assigned-to USER_ID
 - Execute: ghl --yes tasks create --contact-id CONTACT_ID --title "Follow up" --body "Context" --due 2026-07-14T09:00:00-04:00 --assigned-to USER_ID
 - Update due date: ghl --yes tasks update TASK_ID --contact-id CONTACT_ID --due 2026-07-20T09:00:00-04:00
+- Complete: ghl --yes tasks complete TASK_ID --contact-id CONTACT_ID
 - Delete: ghl --yes tasks delete TASK_ID --contact-id CONTACT_ID --confirm-delete TASK_ID
-- Complete is not exposed.
 
 Users (read-only):
 - List: ghl users list
@@ -931,9 +941,9 @@ def build_parser():
     task_search = tasks_sub.add_parser("search")
     task_search.add_argument("--limit", type=int, default=100)
     task_search.add_argument(
-        "--include-unlinked",
+        "--exclude-unlinked",
         action="store_true",
-        help="include records without a contactId",
+        help="exclude records without a contactId",
     )
     task_search.set_defaults(func=search_tasks)
     task_create = tasks_sub.add_parser("create")
@@ -951,6 +961,10 @@ def build_parser():
     task_update.add_argument("--due", help="ISO 8601 datetime with timezone")
     task_update.add_argument("--assigned-to", help="GHL user id")
     task_update.set_defaults(func=update_task)
+    task_complete = tasks_sub.add_parser("complete")
+    task_complete.add_argument("id")
+    task_complete.add_argument("--contact-id", required=True)
+    task_complete.set_defaults(func=complete_task)
     task_delete = tasks_sub.add_parser("delete")
     task_delete.add_argument("id")
     task_delete.add_argument("--contact-id", required=True)

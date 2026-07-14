@@ -170,6 +170,7 @@ Write commands are dry-run by default. Add `--yes` before the command to execute
 ghl --yes contacts upsert --name "Example Person" --email "person@example.com" --tag prospect
 ghl --yes tasks create --contact-id CONTACT_ID --title "Follow up" --body "Context" --due 2026-07-14T09:00:00-04:00 --assigned-to USER_ID
 ghl --yes tasks update TASK_ID --contact-id CONTACT_ID --due 2026-07-20T09:00:00-04:00
+ghl --yes tasks complete TASK_ID --contact-id CONTACT_ID
 ```
 
 Deletes require an extra confirmation matching the record id:
@@ -180,8 +181,8 @@ ghl --yes opportunities delete OPPORTUNITY_ID --confirm-delete OPPORTUNITY_ID
 ghl --yes tasks delete TASK_ID --contact-id CONTACT_ID --confirm-delete TASK_ID
 ```
 
-Task search excludes records without contact linkage by default and reports
-their count. Add `--include-unlinked` to audit them.
+Task search shows every returned record and reports unlinked records. Add
+`--exclude-unlinked` for a filtered operational view.
 
 Do not add outbound messaging, payment, or social-posting commands to this CLI.
 

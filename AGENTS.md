@@ -40,7 +40,6 @@ ghl fields --model opportunity
 ghl tags list
 ghl contacts search --query "Example Co" --limit 20
 ghl tasks search --limit 100
-ghl tasks search --limit 100 --include-unlinked
 ghl users list
 ghl opportunities search --pipeline "Sales Pipeline" --status all --limit 100
 ghl conversations search --contact-id CONTACT_ID
@@ -98,7 +97,7 @@ ghl --yes opportunities delete OPPORTUNITY_ID --confirm-delete OPPORTUNITY_ID
 
 Use GHL Tasks as the dated follow-up backlog for contacts, including contacts
 that do not yet have opportunities. Writes remain dry-run unless `--yes` is
-provided. The CLI does not expose task completion.
+provided.
 
 ```sh
 ghl tasks search --limit 100
@@ -106,12 +105,12 @@ ghl users list
 ghl tasks create --contact-id CONTACT_ID --title "Follow up" --body "Context" --due 2026-07-14T09:00:00-04:00 --assigned-to USER_ID
 ghl --yes tasks create --contact-id CONTACT_ID --title "Follow up" --body "Context" --due 2026-07-14T09:00:00-04:00 --assigned-to USER_ID
 ghl --yes tasks update TASK_ID --contact-id CONTACT_ID --due 2026-07-20T09:00:00-04:00
+ghl --yes tasks complete TASK_ID --contact-id CONTACT_ID
 ghl --yes tasks delete TASK_ID --contact-id CONTACT_ID --confirm-delete TASK_ID
 ```
 
-Task search excludes records without a `contactId` and reports their count. That
-is an actionable-backlog rule, not proof of deletion. Use `--include-unlinked`
-for diagnostics.
+Task search shows every returned record and reports unlinked records. Use
+`--exclude-unlinked` only for a filtered operational view.
 
 ## Conversations (read-only)
 
