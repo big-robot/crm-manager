@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -12,8 +13,9 @@ import urllib.request
 
 BASE_URL = "https://services.leadconnectorhq.com"
 VERSION = "2021-07-28"
+TASKS_VERSION = "v3"
 CONVERSATIONS_VERSION = "2021-04-15"
-CLI_VERSION = "0.1.0"
+CLI_VERSION = "0.3.0"
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 GENERIC_DEFAULT_PIPELINE = "Sales Pipeline"
 GENERIC_CANONICAL_STAGES = [
@@ -434,6 +436,108 @@ def delete_opportunity(args):
     print_json(request("DELETE", f"/opportunities/{args.id}", yes=args.yes) or {})
 
 
+def filter_task_search_result(data, include_unlinked=False):
+    tasks = data.get("tasks")
+    if isinstance(tasks, list) and not include_unlinked:
+        unlinked = [task for task in tasks if not task.get("contactId")]
+        data["tasks"] = [
+            task
+            for task in tasks
+            if task.get("contactId")
+        ]
+        if unlinked:
+            data["unlinkedTaskCount"] = len(unlinked)
+    return data
+
+
+def search_tasks(args):
+    data = request(
+        "POST",
+        f"/locations/{location_id()}/tasks/search",
+        body={"limit": args.limit},
+        mutates=False,
+        version=TASKS_VERSION,
+    )
+    data = filter_task_search_result(data, include_unlinked=args.include_unlinked)
+    print_json(data)
+
+
+def validate_iso_datetime(value, flag="--due"):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        fail(f"expected {flag} as an ISO 8601 datetime with timezone, got {value!r}")
+    if parsed.tzinfo is None:
+        fail(f"expected {flag} as an ISO 8601 datetime with timezone, got {value!r}")
+    return value
+
+
+def create_task(args):
+    body = {
+        "title": args.title,
+        "body": args.body or "",
+        "dueDate": validate_iso_datetime(args.due),
+        "assignedTo": args.assigned_to,
+        "completed": False,
+    }
+    print_json(
+        request(
+            "POST",
+            f"/contacts/{args.contact_id}/tasks",
+            body=body,
+            yes=args.yes,
+            version=TASKS_VERSION,
+        )
+        or {}
+    )
+
+
+def update_task(args):
+    body = {}
+    if args.title:
+        body["title"] = args.title
+    if args.body is not None:
+        body["body"] = args.body
+    if args.due:
+        body["dueDate"] = validate_iso_datetime(args.due)
+    if args.assigned_to:
+        body["assignedTo"] = args.assigned_to
+    if not body:
+        fail("nothing to update")
+    print_json(
+        request(
+            "PUT",
+            f"/contacts/{args.contact_id}/tasks/{args.id}",
+            body=body,
+            yes=args.yes,
+            version=TASKS_VERSION,
+        )
+        or {}
+    )
+
+
+def delete_task(args):
+    require_delete_confirmation(args)
+    print_json(
+        request(
+            "DELETE",
+            f"/contacts/{args.contact_id}/tasks/{args.id}",
+            yes=args.yes,
+            version=TASKS_VERSION,
+        )
+        or {}
+    )
+
+
+def list_users(args):
+    data = request(
+        "GET",
+        "/users/",
+        query={"locationId": location_id()},
+    )
+    print_json(data)
+
+
 def search_conversations(args):
     query = {
         "locationId": location_id(),
@@ -558,6 +662,8 @@ First commands:
 - ghl pipelines
 - ghl fields --model opportunity
 - ghl contacts search --query "Company or person"
+- ghl tasks search --limit 100
+- ghl users list
 - ghl opportunities search --pipeline "{pipeline}" --status all --limit 100
 
 Write flag:
@@ -577,6 +683,18 @@ Opportunities:
 - Update: ghl --yes opportunities update OPPORTUNITY_ID --pipeline "{pipeline}" --stage "Qualified" --value 0 --field "Next Step=Book discovery."
 - Next-step hygiene (only fields it can touch): ghl --yes opportunities next-step OPPORTUNITY_ID --step "Follow up after install." --date 2026-07-10
 - Delete: ghl --yes opportunities delete OPPORTUNITY_ID --confirm-delete OPPORTUNITY_ID
+
+Tasks:
+- Search: ghl tasks search --limit 100
+- Audit unlinked search records: ghl tasks search --limit 100 --include-unlinked
+- Dry run: ghl tasks create --contact-id CONTACT_ID --title "Follow up" --body "Context" --due 2026-07-14T09:00:00-04:00 --assigned-to USER_ID
+- Execute: ghl --yes tasks create --contact-id CONTACT_ID --title "Follow up" --body "Context" --due 2026-07-14T09:00:00-04:00 --assigned-to USER_ID
+- Update due date: ghl --yes tasks update TASK_ID --contact-id CONTACT_ID --due 2026-07-20T09:00:00-04:00
+- Delete: ghl --yes tasks delete TASK_ID --contact-id CONTACT_ID --confirm-delete TASK_ID
+- Complete is not exposed.
+
+Users (read-only):
+- List: ghl users list
 
 Conversations (read-only):
 - Search by contact: ghl conversations search --contact-id CONTACT_ID
@@ -807,6 +925,41 @@ def build_parser():
     opp_delete.add_argument("id")
     opp_delete.add_argument("--confirm-delete", help="required with --yes; must equal id")
     opp_delete.set_defaults(func=delete_opportunity)
+
+    tasks = sub.add_parser("tasks", help="access to GHL contact follow-up tasks")
+    tasks_sub = tasks.add_subparsers(dest="tasks_command", required=True)
+    task_search = tasks_sub.add_parser("search")
+    task_search.add_argument("--limit", type=int, default=100)
+    task_search.add_argument(
+        "--include-unlinked",
+        action="store_true",
+        help="include records without a contactId",
+    )
+    task_search.set_defaults(func=search_tasks)
+    task_create = tasks_sub.add_parser("create")
+    task_create.add_argument("--contact-id", required=True)
+    task_create.add_argument("--title", required=True)
+    task_create.add_argument("--body")
+    task_create.add_argument("--due", required=True, help="ISO 8601 datetime with timezone")
+    task_create.add_argument("--assigned-to", required=True, help="GHL user id")
+    task_create.set_defaults(func=create_task)
+    task_update = tasks_sub.add_parser("update")
+    task_update.add_argument("id")
+    task_update.add_argument("--contact-id", required=True)
+    task_update.add_argument("--title")
+    task_update.add_argument("--body")
+    task_update.add_argument("--due", help="ISO 8601 datetime with timezone")
+    task_update.add_argument("--assigned-to", help="GHL user id")
+    task_update.set_defaults(func=update_task)
+    task_delete = tasks_sub.add_parser("delete")
+    task_delete.add_argument("id")
+    task_delete.add_argument("--contact-id", required=True)
+    task_delete.add_argument("--confirm-delete", help="required with --yes; must equal id")
+    task_delete.set_defaults(func=delete_task)
+
+    users = sub.add_parser("users", help="read-only access to GHL users")
+    users_sub = users.add_subparsers(dest="users_command", required=True)
+    users_sub.add_parser("list").set_defaults(func=list_users)
 
     convos = sub.add_parser("conversations", help="read-only access to captured conversations")
     convos_sub = convos.add_subparsers(dest="conversations_command", required=True)

@@ -118,6 +118,8 @@ Recommended steady-state permissions:
   "locations/customFields.write",
   "locations/tags.readonly",
   "locations/tags.write",
+  "locations/tasks.readonly",
+  "users.readonly",
   "conversations.readonly",
   "conversations/message.readonly"
 ]
@@ -133,6 +135,9 @@ Notes:
   add `conversations/message.write`.
 - `locations/customFields.readonly` is needed to map field names to ids.
 - `locations/customFields.write` is needed for setup or repair of CRM fields.
+- `locations/tasks.readonly` is needed to read the dated contact follow-up backlog.
+- `contacts.write` also covers creating contact follow-up tasks.
+- `users.readonly` is needed to find the assignee id for a task.
 - Temporarily add `pipelines.write` and `pipelines.create` only when creating or
   repairing the pipeline through API tooling. Remove them afterward.
 - After changing permissions or rotating the token, run:
@@ -150,7 +155,10 @@ ghl pipelines
 ghl fields --model opportunity
 ghl tags list
 ghl contacts search --query "Example Co"
+ghl tasks search --limit 100
+ghl users list
 ghl opportunities search --pipeline "Sales Pipeline" --status all
+ghl tasks search --limit 100
 ghl conversations search --contact-id CONTACT_ID
 ghl conversations messages CONVERSATION_ID
 ghl cleanup audit
@@ -160,6 +168,8 @@ Write commands are dry-run by default. Add `--yes` before the command to execute
 
 ```sh
 ghl --yes contacts upsert --name "Example Person" --email "person@example.com" --tag prospect
+ghl --yes tasks create --contact-id CONTACT_ID --title "Follow up" --body "Context" --due 2026-07-14T09:00:00-04:00 --assigned-to USER_ID
+ghl --yes tasks update TASK_ID --contact-id CONTACT_ID --due 2026-07-20T09:00:00-04:00
 ```
 
 Deletes require an extra confirmation matching the record id:
@@ -167,7 +177,11 @@ Deletes require an extra confirmation matching the record id:
 ```sh
 ghl --yes contacts delete CONTACT_ID --confirm-delete CONTACT_ID
 ghl --yes opportunities delete OPPORTUNITY_ID --confirm-delete OPPORTUNITY_ID
+ghl --yes tasks delete TASK_ID --contact-id CONTACT_ID --confirm-delete TASK_ID
 ```
+
+Task search excludes records without contact linkage by default and reports
+their count. Add `--include-unlinked` to audit them.
 
 Do not add outbound messaging, payment, or social-posting commands to this CLI.
 
