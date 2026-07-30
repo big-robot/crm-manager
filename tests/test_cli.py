@@ -1,3 +1,4 @@
+import json
 import os
 import runpy
 import subprocess
@@ -79,6 +80,204 @@ class GhlCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"dryRun": true', result.stdout)
         self.assertIn("/contacts/contact123", result.stdout)
+
+    def test_contacts_get_is_read_only_and_needs_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "contacts", "get", "contact123", cwd=tmp, env=clean_env(tmp)
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing GHL_PRIVATE_INTEGRATION_TOKEN", result.stderr)
+        self.assertNotIn("dryRun", result.stdout)
+
+    def test_contacts_create_defaults_to_guarded_dry_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = clean_env(tmp)
+            env["GHL_LOCATION_ID"] = "location123"
+            result = self.run_cli(
+                "contacts",
+                "create",
+                "--name",
+                "Example Person",
+                "--email",
+                "person@example.invalid",
+                cwd=tmp,
+                env=env,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["dryRun"])
+        self.assertEqual(payload["method"], "POST")
+        self.assertEqual(payload["url"], "https://services.leadconnectorhq.com/contacts/")
+        self.assertEqual(
+            payload["body"],
+            {
+                "locationId": "location123",
+                "name": "Example Person",
+                "email": "person@example.invalid",
+            },
+        )
+
+    def test_contacts_create_validates_phone_entries_before_env_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "contacts",
+                "create",
+                "--name",
+                "Example Person",
+                "--phone-entry",
+                "Fax=+1 555-010-1001",
+                cwd=tmp,
+                env=clean_env(tmp),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid phone label", result.stderr)
+        self.assertNotIn("missing GHL_LOCATION_ID", result.stderr)
+
+    def test_contacts_update_serializes_ordered_phone_entries_and_additional_emails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "contacts",
+                "update",
+                "contact123",
+                "--phone-entry",
+                "Mobile=+1 555-010-1001",
+                "--phone-entry",
+                "Work=+1 555-010-1002",
+                "--phone-entry",
+                "Unlabeled=+1 555-010-1003",
+                "--additional-email",
+                "alternate@example.invalid",
+                cwd=tmp,
+                env=clean_env(tmp),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            payload["body"]["additionalPhones"],
+            [
+                {"phone": "+1 555-010-1001", "label": "Mobile"},
+                {"phone": "+1 555-010-1002", "label": "Work"},
+                {"phone": "+1 555-010-1003"},
+            ],
+        )
+        self.assertEqual(
+            payload["body"]["additionalEmails"],
+            [{"email": "alternate@example.invalid"}],
+        )
+
+    def test_contacts_update_rejects_invalid_phone_label_before_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "contacts",
+                "update",
+                "contact123",
+                "--phone-entry",
+                "Fax=+1 555-010-1001",
+                cwd=tmp,
+                env=clean_env(tmp),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid phone label", result.stderr)
+        self.assertNotIn("missing GHL_PRIVATE_INTEGRATION_TOKEN", result.stderr)
+
+    def test_contacts_update_rejects_mixed_phone_interfaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "contacts",
+                "update",
+                "contact123",
+                "--phone",
+                "+1 555-010-1001",
+                "--phone-entry",
+                "Mobile=+1 555-010-1002",
+                cwd=tmp,
+                env=clean_env(tmp),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot be combined", result.stderr)
+        self.assertNotIn("missing GHL_PRIVATE_INTEGRATION_TOKEN", result.stderr)
+
+    def test_contacts_update_rejects_equivalent_nanp_phone_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "contacts",
+                "update",
+                "contact123",
+                "--phone-entry",
+                "Mobile=(202) 555-0101",
+                "--phone-entry",
+                "Work=+1 202 555 0101",
+                cwd=tmp,
+                env=clean_env(tmp),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate phone", result.stderr)
+        self.assertNotIn("missing GHL_PRIVATE_INTEGRATION_TOKEN", result.stderr)
+
+    def test_contact_dnd_payload_preserves_untouched_channels(self):
+        module = runpy.run_path(str(CLI))
+        merge_dnd_settings = module["merge_dnd_settings"]
+        existing = {
+            "dndSettings": {
+                "Email": {"status": "inactive", "message": "kept"},
+                "SMS": {"status": "permanent"},
+            }
+        }
+
+        result = merge_dnd_settings(existing, "Email", "active")
+
+        self.assertEqual(
+            result,
+            {
+                "Email": {"status": "active", "message": "kept"},
+                "SMS": {"status": "permanent"},
+            },
+        )
+        self.assertEqual(existing["dndSettings"]["Email"]["status"], "inactive")
+
+    def test_contacts_dnd_rejects_invalid_channel_and_status_before_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = clean_env(tmp)
+            bad_channel = self.run_cli(
+                "contacts",
+                "dnd",
+                "contact123",
+                "--channel",
+                "Postal",
+                "--status",
+                "active",
+                cwd=tmp,
+                env=env,
+            )
+            bad_status = self.run_cli(
+                "contacts",
+                "dnd",
+                "contact123",
+                "--channel",
+                "Email",
+                "--status",
+                "blocked",
+                cwd=tmp,
+                env=env,
+            )
+
+        self.assertNotEqual(bad_channel.returncode, 0)
+        self.assertIn("invalid choice", bad_channel.stderr)
+        self.assertNotIn("missing GHL_PRIVATE_INTEGRATION_TOKEN", bad_channel.stderr)
+        self.assertNotEqual(bad_status.returncode, 0)
+        self.assertIn("invalid choice", bad_status.stderr)
+        self.assertNotIn("missing GHL_PRIVATE_INTEGRATION_TOKEN", bad_status.stderr)
+
+    def test_contact_subcommands_are_registered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = clean_env(tmp)
+            for command in ("get", "create", "update", "dnd"):
+                with self.subTest(command=command):
+                    result = self.run_cli(
+                        "contacts", command, "--help", cwd=tmp, env=env
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_conversations_search_is_a_read_that_needs_env(self):
         with tempfile.TemporaryDirectory() as tmp:

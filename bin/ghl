@@ -322,6 +322,109 @@ def search_contacts(args):
     print_json(data)
 
 
+def get_contact(args):
+    print_json(request("GET", f"/contacts/{args.id}"))
+
+
+PHONE_LABELS = {
+    "home": "Home",
+    "work": "Work",
+    "mobile": "Mobile",
+    "landline": "Landline",
+    "unlabeled": None,
+}
+
+DND_CHANNELS = ("Call", "Email", "SMS", "WhatsApp", "GMB", "FB")
+DND_STATUSES = ("active", "inactive", "permanent")
+
+
+def parse_phone_entries(values):
+    entries = []
+    seen = set()
+    for item in values or []:
+        if "=" not in item:
+            fail(f"expected LABEL=PHONE, got {item!r}")
+        raw_label, phone = item.split("=", 1)
+        label_key = raw_label.strip().lower()
+        phone = phone.strip()
+        if label_key not in PHONE_LABELS:
+            fail(
+                "invalid phone label; expected Home, Work, Mobile, Landline, or Unlabeled"
+            )
+        if not phone:
+            fail(f"empty phone value in {item!r}")
+        normalized = re.sub(r"\D", "", phone)
+        if not normalized:
+            fail(f"invalid phone value in {item!r}")
+        if len(normalized) == 10:
+            normalized = f"1{normalized}"
+        if normalized in seen:
+            fail(f"duplicate phone value: {phone}")
+        seen.add(normalized)
+        entry = {"phone": phone}
+        label = PHONE_LABELS[label_key]
+        if label:
+            entry["label"] = label
+        entries.append(entry)
+    return entries
+
+
+def contact_write_body(args, *, require_name=False):
+    body = {}
+    if require_name and not args.name:
+        fail("--name is required")
+    if args.name:
+        body["name"] = args.name
+    if args.email:
+        body["email"] = args.email
+    if args.company:
+        body["companyName"] = args.company
+    if args.tag:
+        body["tags"] = args.tag
+
+    phone_entries = parse_phone_entries(args.phone_entry)
+    if phone_entries and (args.phone or args.phone_label):
+        fail("--phone-entry cannot be combined with --phone or --phone-label")
+    if phone_entries:
+        body["additionalPhones"] = phone_entries
+    elif args.phone:
+        body["phone"] = args.phone
+        if args.phone_label:
+            body["phoneLabel"] = args.phone_label
+    elif args.phone_label:
+        fail("--phone-label requires --phone")
+
+    if args.additional_email:
+        body["additionalEmails"] = [{"email": email} for email in args.additional_email]
+
+    fields = parse_kv(args.field)
+    if fields:
+        body["customFields"] = custom_field_payload("contact", fields)
+    return body
+
+
+def add_contact_write_arguments(parser, *, require_name=False):
+    parser.add_argument("--name", required=require_name)
+    parser.add_argument("--email")
+    parser.add_argument("--phone")
+    parser.add_argument("--phone-label", choices=["Home", "Work", "Mobile", "Landline"])
+    parser.add_argument(
+        "--phone-entry",
+        action="append",
+        help="complete ordered phone set as LABEL=PHONE; repeat as needed",
+    )
+    parser.add_argument("--additional-email", action="append")
+    parser.add_argument("--company")
+    parser.add_argument("--tag", action="append")
+    parser.add_argument("--field", action="append", help="custom field as NAME=VALUE")
+
+
+def create_contact(args):
+    contact_body = contact_write_body(args, require_name=True)
+    body = {"locationId": location_id(), **contact_body}
+    print_json(request("POST", "/contacts/", body=body, yes=args.yes) or {})
+
+
 def upsert_contact(args):
     body = {
         "locationId": location_id(),
@@ -339,22 +442,30 @@ def upsert_contact(args):
 
 
 def update_contact(args):
-    body = {}
-    if args.name:
-        body["name"] = args.name
-    if args.email:
-        body["email"] = args.email
-    if args.phone:
-        body["phone"] = args.phone
-    if args.company:
-        body["companyName"] = args.company
-    if args.tag:
-        body["tags"] = args.tag
-    fields = parse_kv(args.field)
-    if fields:
-        body["customFields"] = custom_field_payload("contact", fields)
+    body = contact_write_body(args)
     if not body:
         fail("nothing to update")
+    print_json(request("PUT", f"/contacts/{args.id}", body=body, yes=args.yes) or {})
+
+
+def merge_dnd_settings(contact, channel, status):
+    current = contact.get("dndSettings") or {}
+    if not isinstance(current, dict):
+        fail("contact dndSettings is not an object")
+    merged = {key: value.copy() if isinstance(value, dict) else value for key, value in current.items()}
+    channel_settings = merged.get(channel) or {}
+    if not isinstance(channel_settings, dict):
+        fail(f"contact dndSettings.{channel} is not an object")
+    merged[channel] = {**channel_settings, "status": status}
+    return merged
+
+
+def update_contact_dnd(args):
+    data = request("GET", f"/contacts/{args.id}")
+    contact = data.get("contact", data)
+    if not isinstance(contact, dict):
+        fail("contact response is not an object")
+    body = {"dndSettings": merge_dnd_settings(contact, args.channel, args.status)}
     print_json(request("PUT", f"/contacts/{args.id}", body=body, yes=args.yes) or {})
 
 
@@ -683,8 +794,11 @@ Write flag:
 
 Contacts:
 - Search: ghl contacts search --query "{contact_query}" --limit 20
+- Exact read: ghl contacts get CONTACT_ID
+- Create (may trigger configured location automations): ghl --yes contacts create --name "{contact_name}" --email "{contact_email}" --company "{company_name}"
 - Upsert: ghl --yes contacts upsert --name "{contact_name}" --email "{contact_email}" --company "{company_name}" --tag prospect --field "Account Status=Prospect" --field "Primary Relationship=Decision Maker"
-- Update: ghl --yes contacts update CONTACT_ID --field "Account Notes=..."
+- Update: ghl --yes contacts update CONTACT_ID --phone-entry "Mobile=+15550101001" --phone-entry "Work=+15550101002" --additional-email "alternate@example.invalid" --field "Account Notes=..."
+- DND: ghl --yes contacts dnd CONTACT_ID --channel Email --status active
 - Delete: ghl --yes contacts delete CONTACT_ID --confirm-delete CONTACT_ID
 
 Opportunities:
@@ -876,6 +990,12 @@ def build_parser():
     contact_search.add_argument("--limit", type=int, default=20)
     contact_search.add_argument("--page", type=int, default=1)
     contact_search.set_defaults(func=search_contacts)
+    contact_get = contacts_sub.add_parser("get")
+    contact_get.add_argument("id")
+    contact_get.set_defaults(func=get_contact)
+    contact_create = contacts_sub.add_parser("create")
+    add_contact_write_arguments(contact_create, require_name=True)
+    contact_create.set_defaults(func=create_contact)
     contact_upsert = contacts_sub.add_parser("upsert")
     contact_upsert.add_argument("--name")
     contact_upsert.add_argument("--email")
@@ -886,13 +1006,13 @@ def build_parser():
     contact_upsert.set_defaults(func=upsert_contact)
     contact_update = contacts_sub.add_parser("update")
     contact_update.add_argument("id")
-    contact_update.add_argument("--name")
-    contact_update.add_argument("--email")
-    contact_update.add_argument("--phone")
-    contact_update.add_argument("--company")
-    contact_update.add_argument("--tag", action="append")
-    contact_update.add_argument("--field", action="append", help="custom field as NAME=VALUE")
+    add_contact_write_arguments(contact_update)
     contact_update.set_defaults(func=update_contact)
+    contact_dnd = contacts_sub.add_parser("dnd")
+    contact_dnd.add_argument("id")
+    contact_dnd.add_argument("--channel", choices=DND_CHANNELS, required=True)
+    contact_dnd.add_argument("--status", choices=DND_STATUSES, required=True)
+    contact_dnd.set_defaults(func=update_contact_dnd)
     contact_delete = contacts_sub.add_parser("delete")
     contact_delete.add_argument("id")
     contact_delete.add_argument("--confirm-delete", help="required with --yes; must equal id")

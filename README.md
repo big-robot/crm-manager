@@ -155,6 +155,7 @@ ghl pipelines
 ghl fields --model opportunity
 ghl tags list
 ghl contacts search --query "Example Co"
+ghl contacts get CONTACT_ID
 ghl tasks search --limit 100
 ghl users list
 ghl opportunities search --pipeline "Sales Pipeline" --status all
@@ -168,6 +169,9 @@ Write commands are dry-run by default. Add `--yes` before the command to execute
 
 ```sh
 ghl --yes contacts upsert --name "Example Person" --email "person@example.com" --tag prospect
+ghl --yes contacts create --name "Example Person" --email "person@example.invalid"
+ghl --yes contacts update CONTACT_ID --phone-entry "Mobile=+15550101001" --phone-entry "Work=+15550101002" --additional-email "alternate@example.invalid"
+ghl --yes contacts dnd CONTACT_ID --channel Email --status active
 ghl --yes tasks create --contact-id CONTACT_ID --title "Follow up" --body "Context" --due 2026-07-14T09:00:00-04:00 --assigned-to USER_ID
 ghl --yes tasks update TASK_ID --contact-id CONTACT_ID --due 2026-07-20T09:00:00-04:00
 ghl --yes tasks complete TASK_ID --contact-id CONTACT_ID
@@ -185,6 +189,19 @@ Task search shows every returned record and reports unlinked records. Add
 `--exclude-unlinked` for a filtered operational view.
 
 Do not add outbound messaging, payment, or social-posting commands to this CLI.
+
+`contacts create` is the explicit creation path. Unlike `contacts upsert`, it
+does not intentionally select an existing contact through the location's
+duplicate rules. Contact creation can still activate automations configured in
+the GHL location, so preview and approve the exact record first.
+
+For `contacts update`, repeated `--phone-entry LABEL=PHONE` values replace the
+complete ordered GHL phone set. The first value becomes primary. Supported
+labels are `Home`, `Work`, `Mobile`, `Landline`, and `Unlabeled`. Additional
+emails are retained without labels because GHL does not support them.
+
+For DND, `active` means DND is active for that channel. The constrained command
+reads the current contact and preserves every untouched channel setting.
 
 ## Local Tests
 

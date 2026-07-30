@@ -51,12 +51,38 @@ Search first to avoid duplicates:
 
 ```sh
 ghl contacts search --query "Jane" --limit 20
+ghl contacts get CONTACT_ID
 ```
 
-Upsert:
+Use explicit create for a new record. Preview first; GHL location automations
+may react to contact creation:
+
+```sh
+ghl contacts create --name "Jane Doe" --email "jane@example.invalid"
+ghl --yes contacts create --name "Jane Doe" --email "jane@example.invalid"
+```
+
+Use upsert only when location duplicate-rule matching is intentional:
 
 ```sh
 ghl --yes contacts upsert --name "Jane Doe" --email "jane@example.com" --company "Example Co" --tag prospect --field "Account Status=Prospect" --field "Primary Relationship=Decision Maker"
+```
+
+Repeated phone entries replace the complete ordered phone set; the first is
+primary. Supported labels are `Home`, `Work`, `Mobile`, `Landline`, and
+`Unlabeled`. Additional emails are unlabeled in GHL:
+
+```sh
+ghl contacts update CONTACT_ID --phone-entry "Mobile=+15550101001" --phone-entry "Work=+15550101002" --additional-email "alternate@example.invalid"
+ghl --yes contacts update CONTACT_ID --phone-entry "Mobile=+15550101001" --phone-entry "Work=+15550101002" --additional-email "alternate@example.invalid"
+```
+
+For DND, `active` means blocked for that channel. The command preserves every
+untouched channel:
+
+```sh
+ghl contacts dnd CONTACT_ID --channel Email --status active
+ghl --yes contacts dnd CONTACT_ID --channel Email --status active
 ```
 
 ## Opportunities
