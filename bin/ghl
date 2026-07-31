@@ -2,6 +2,7 @@
 import argparse
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -14,6 +15,7 @@ import urllib.request
 BASE_URL = "https://services.leadconnectorhq.com"
 VERSION = "2021-07-28"
 TASKS_VERSION = "v3"
+TASK_SEARCH_PAGE_SIZE = 20
 CONVERSATIONS_VERSION = "2021-04-15"
 CLI_VERSION = "0.3.0"
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
@@ -558,14 +560,99 @@ def filter_task_search_result(data, exclude_unlinked=False):
     return data
 
 
+class TaskPaginationError(RuntimeError):
+    pass
+
+
+def validate_task_search_cursor(cursor, page_number):
+    def valid_number(value):
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        )
+
+    if (
+        not isinstance(cursor, list)
+        or len(cursor) != 2
+        or not valid_number(cursor[0])
+        or not isinstance(cursor[1], str)
+        or not cursor[1]
+    ):
+        raise TaskPaginationError(
+            f"task search page {page_number} returned a malformed searchAfter cursor"
+        )
+    return cursor
+
+
+def paginate_task_search(limit, fetch_page):
+    if limit <= 0:
+        raise TaskPaginationError("task search --limit must be greater than zero")
+
+    result = None
+    collected = []
+    cursor = None
+    seen_cursors = set()
+    page_number = 0
+
+    while len(collected) < limit:
+        page_number += 1
+        body = {"limit": min(TASK_SEARCH_PAGE_SIZE, limit - len(collected))}
+        if cursor is not None:
+            body["searchAfter"] = cursor
+
+        page = fetch_page(body)
+        if not isinstance(page, dict):
+            raise TaskPaginationError(
+                f"task search page {page_number} returned a malformed response"
+            )
+        tasks = page.get("tasks")
+        if not isinstance(tasks, list):
+            raise TaskPaginationError(
+                f"task search page {page_number} returned a malformed tasks list"
+            )
+        if result is None:
+            result = dict(page)
+
+        remaining = limit - len(collected)
+        collected.extend(tasks[:remaining])
+        if len(collected) >= limit or len(tasks) < TASK_SEARCH_PAGE_SIZE:
+            break
+
+        last_task = tasks[-1]
+        if not isinstance(last_task, dict) or "searchAfter" not in last_task:
+            raise TaskPaginationError(
+                f"task search page {page_number} is missing a searchAfter cursor"
+            )
+        cursor = validate_task_search_cursor(last_task["searchAfter"], page_number)
+        cursor_key = json.dumps(cursor, separators=(",", ":"))
+        if cursor_key in seen_cursors:
+            raise TaskPaginationError(
+                f"task search page {page_number} repeated its searchAfter cursor"
+            )
+        seen_cursors.add(cursor_key)
+
+    result = result or {"tasks": []}
+    result["tasks"] = collected
+    return result
+
+
 def search_tasks(args):
-    data = request(
-        "POST",
-        f"/locations/{location_id()}/tasks/search",
-        body={"limit": args.limit},
-        mutates=False,
-        version=TASKS_VERSION,
-    )
+    path = f"/locations/{location_id()}/tasks/search"
+
+    def fetch_page(body):
+        return request(
+            "POST",
+            path,
+            body=body,
+            mutates=False,
+            version=TASKS_VERSION,
+        )
+
+    try:
+        data = paginate_task_search(args.limit, fetch_page)
+    except TaskPaginationError as exc:
+        fail(str(exc))
     data = filter_task_search_result(data, exclude_unlinked=args.exclude_unlinked)
     print_json(data)
 

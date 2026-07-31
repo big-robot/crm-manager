@@ -1,9 +1,12 @@
+from contextlib import redirect_stdout
+import io
 import json
 import os
 import runpy
 import subprocess
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 
@@ -321,6 +324,248 @@ class GhlCliTests(unittest.TestCase):
 
         self.assertEqual(result["tasks"], [])
         self.assertEqual(result["unlinkedTaskCount"], 1)
+
+    def test_task_search_pagination_stops_after_one_short_page(self):
+        module = runpy.run_path(str(CLI))
+        paginate = module["paginate_task_search"]
+        calls = []
+
+        def fetch_page(body):
+            calls.append(body)
+            return {"tasks": [{"_id": f"task-{index}"} for index in range(3)]}
+
+        result = paginate(100, fetch_page)
+
+        self.assertEqual(len(result["tasks"]), 3)
+        self.assertEqual(calls, [{"limit": 20}])
+
+    def test_task_search_handler_aggregates_filters_and_preserves_request_contract(self):
+        module = runpy.run_path(str(CLI))
+        calls = []
+        pages = [
+            {
+                "tasks": [
+                    {
+                        "_id": f"task-{index}",
+                        "contactId": None if index == 0 else f"contact-{index}",
+                        "searchAfter": [1000 + index, f"task-{index}"],
+                    }
+                    for index in range(20)
+                ],
+                "traceId": "first-page",
+            },
+            {
+                "tasks": [
+                    {
+                        "_id": "task-20",
+                        "contactId": None,
+                        "searchAfter": [1020, "task-20"],
+                    }
+                ]
+            },
+        ]
+
+        def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            return pages.pop(0)
+
+        handler_globals = module["search_tasks"].__globals__
+        handler_globals["location_id"] = lambda: "location123"
+        handler_globals["request"] = fake_request
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            module["search_tasks"](
+                SimpleNamespace(limit=100, exclude_unlinked=True)
+            )
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(len(result["tasks"]), 19)
+        self.assertEqual(result["unlinkedTaskCount"], 2)
+        self.assertEqual(result["traceId"], "first-page")
+        self.assertEqual(
+            calls[0],
+            (
+                "POST",
+                "/locations/location123/tasks/search",
+                {
+                    "body": {"limit": 20},
+                    "mutates": False,
+                    "version": "v3",
+                },
+            ),
+        )
+        self.assertEqual(
+            calls[1][2]["body"],
+            {"limit": 20, "searchAfter": [1019, "task-19"]},
+        )
+
+    def test_task_search_pagination_preserves_empty_first_page_structure(self):
+        module = runpy.run_path(str(CLI))
+        paginate = module["paginate_task_search"]
+
+        result = paginate(100, lambda _body: {"tasks": [], "traceId": "empty"})
+
+        self.assertEqual(result, {"tasks": [], "traceId": "empty"})
+
+    def test_task_search_pagination_rejects_nonpositive_limit(self):
+        module = runpy.run_path(str(CLI))
+        paginate = module["paginate_task_search"]
+        pagination_error = module["TaskPaginationError"]
+
+        for limit in (0, -1):
+            with self.subTest(limit=limit):
+                with self.assertRaisesRegex(pagination_error, "greater than zero"):
+                    paginate(limit, lambda _body: {"tasks": []})
+
+    def test_task_search_pagination_fetches_empty_page_after_exactly_twenty(self):
+        module = runpy.run_path(str(CLI))
+        paginate = module["paginate_task_search"]
+        cursor = [1000, "task-19"]
+        pages = [
+            {
+                "tasks": [
+                    {"_id": f"task-{index}", "searchAfter": [1000, f"task-{index}"]}
+                    for index in range(20)
+                ],
+                "traceId": "first-page",
+            },
+            {"tasks": [], "traceId": "second-page"},
+        ]
+        calls = []
+
+        def fetch_page(body):
+            calls.append(body)
+            return pages.pop(0)
+
+        result = paginate(100, fetch_page)
+
+        self.assertEqual(len(result["tasks"]), 20)
+        self.assertEqual(result["traceId"], "first-page")
+        self.assertEqual(calls, [{"limit": 20}, {"limit": 20, "searchAfter": cursor}])
+
+    def test_task_search_pagination_combines_multiple_pages(self):
+        module = runpy.run_path(str(CLI))
+        paginate = module["paginate_task_search"]
+        pages = []
+        for start, count in ((0, 20), (20, 20), (40, 5)):
+            pages.append(
+                {
+                    "tasks": [
+                        {
+                            "_id": f"task-{index}",
+                            "searchAfter": [1000 + index, f"task-{index}"],
+                        }
+                        for index in range(start, start + count)
+                    ]
+                }
+            )
+        calls = []
+
+        def fetch_page(body):
+            calls.append(body)
+            return pages.pop(0)
+
+        result = paginate(100, fetch_page)
+
+        self.assertEqual(len(result["tasks"]), 45)
+        self.assertEqual(result["tasks"][20]["_id"], "task-20")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[1]["searchAfter"], [1019, "task-19"])
+        self.assertEqual(calls[2]["searchAfter"], [1039, "task-39"])
+
+    def test_task_search_pagination_truncates_at_requested_limit(self):
+        module = runpy.run_path(str(CLI))
+        paginate = module["paginate_task_search"]
+        calls = []
+
+        def fetch_page(body):
+            calls.append(body)
+            start = 0 if len(calls) == 1 else 20
+            return {
+                "tasks": [
+                    {
+                        "_id": f"task-{index}",
+                        "searchAfter": [1000 + index, f"task-{index}"],
+                    }
+                    for index in range(start, start + 20)
+                ]
+            }
+
+        result = paginate(25, fetch_page)
+
+        self.assertEqual(len(result["tasks"]), 25)
+        self.assertEqual(result["tasks"][-1]["_id"], "task-24")
+        self.assertEqual(calls[1]["limit"], 5)
+        self.assertEqual(len(calls), 2)
+
+    def test_task_search_pagination_rejects_malformed_cursor(self):
+        module = runpy.run_path(str(CLI))
+        paginate = module["paginate_task_search"]
+        pagination_error = module["TaskPaginationError"]
+
+        def fetch_page(_body):
+            return {
+                "tasks": [
+                    {"_id": f"task-{index}", "searchAfter": "not-a-cursor"}
+                    for index in range(20)
+                ]
+            }
+
+        with self.assertRaisesRegex(pagination_error, "malformed searchAfter cursor"):
+            paginate(100, fetch_page)
+
+    def test_task_search_pagination_rejects_missing_cursor(self):
+        module = runpy.run_path(str(CLI))
+        paginate = module["paginate_task_search"]
+        pagination_error = module["TaskPaginationError"]
+
+        def fetch_page(_body):
+            return {"tasks": [{"_id": f"task-{index}"} for index in range(20)]}
+
+        with self.assertRaisesRegex(pagination_error, "missing a searchAfter cursor"):
+            paginate(100, fetch_page)
+
+    def test_task_search_pagination_rejects_repeated_cursor(self):
+        module = runpy.run_path(str(CLI))
+        paginate = module["paginate_task_search"]
+        pagination_error = module["TaskPaginationError"]
+        cursor = [1000, "task-boundary"]
+        call_count = 0
+
+        def fetch_page(_body):
+            nonlocal call_count
+            call_count += 1
+            return {
+                "tasks": [
+                    {"_id": f"task-{call_count}-{index}", "searchAfter": cursor}
+                    for index in range(20)
+                ]
+            }
+
+        with self.assertRaisesRegex(pagination_error, "repeated its searchAfter cursor"):
+            paginate(100, fetch_page)
+        self.assertEqual(call_count, 2)
+
+    def test_task_search_pagination_surfaces_later_page_failure(self):
+        module = runpy.run_path(str(CLI))
+        paginate = module["paginate_task_search"]
+        calls = 0
+
+        def fetch_page(_body):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("synthetic API failure")
+            return {
+                "tasks": [
+                    {"_id": f"task-{index}", "searchAfter": [1000, f"task-{index}"]}
+                    for index in range(20)
+                ]
+            }
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic API failure"):
+            paginate(100, fetch_page)
+        self.assertEqual(calls, 2)
 
     def test_tasks_create_defaults_to_guarded_dry_run(self):
         with tempfile.TemporaryDirectory() as tmp:
