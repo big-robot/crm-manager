@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from datetime import datetime
+import hashlib
 import json
 import math
 import os
@@ -17,6 +18,7 @@ VERSION = "2021-07-28"
 TASKS_VERSION = "v3"
 TASK_SEARCH_PAGE_SIZE = 20
 CONVERSATIONS_VERSION = "2021-04-15"
+CONVERSATION_MESSAGES_VERSION = "v3"
 CLI_VERSION = "0.3.0"
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 GENERIC_DEFAULT_PIPELINE = "Sales Pipeline"
@@ -34,6 +36,8 @@ CONFIG_FILENAMES = (".ghl-cli.json", "ghl-cli.json")
 _CONFIG = None
 _DOTENV = None
 PRIVATE_INPUT_MAX_BYTES = 1024 * 1024
+CAPTURE_PRIVATE_INPUT_MAX_BYTES = 32 * 1024 * 1024
+CAPTURE_COMMENT_MAX_BYTES = 8 * 1024 * 1024
 CAPTURE_METADATA_START = "--- message-monitor:v1 ---"
 CAPTURE_METADATA_END = "--- end-message-monitor ---"
 
@@ -1064,6 +1068,263 @@ def logged_messages(args):
     print_json(classify_logged_message_overlap(comments, source_guids))
 
 
+def parse_rfc3339(value):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
+        value,
+    ):
+        raise ValueError
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError
+    if parsed.utcoffset() is None:
+        raise ValueError
+    return parsed
+
+
+def valid_capture_text(value, *, allow_empty=False):
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return (
+        (allow_empty or bool(value.strip()))
+        and "\x00" not in value
+        and "--- message-monitor:" not in value
+        and CAPTURE_METADATA_END not in value
+        and "<userid>" not in value.lower()
+        and "</userid>" not in value.lower()
+    )
+
+
+def valid_capture_token(value):
+    return valid_capture_text(value) and not any(
+        ord(char) < 32 or ord(char) == 127 for char in value
+    )
+
+
+def valid_provider_id(value):
+    return isinstance(value, str) and bool(
+        re.fullmatch(r"[A-Za-z0-9_-]{1,256}", value)
+    )
+
+
+def read_log_capture_input():
+    raw = sys.stdin.read(CAPTURE_PRIVATE_INPUT_MAX_BYTES + 1)
+    if len(raw.encode("utf-8")) > CAPTURE_PRIVATE_INPUT_MAX_BYTES:
+        fail("private input is too large")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        fail("invalid private input")
+    expected_fields = {
+        "contactName",
+        "phone",
+        "start",
+        "end",
+        "summary",
+        "transcript",
+        "attachmentReferences",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        fail("invalid private input")
+
+    contact_name = value.get("contactName")
+    phone = value.get("phone")
+    start = value.get("start")
+    end = value.get("end")
+    summary = value.get("summary")
+    transcript = value.get("transcript")
+    attachment_references = value.get("attachmentReferences")
+    try:
+        start_time = parse_rfc3339(start)
+        end_time = parse_rfc3339(end)
+    except ValueError:
+        fail("invalid private input")
+    if (
+        not valid_capture_token(contact_name)
+        or not isinstance(phone, str)
+        or not normalized_phone(phone)
+        or end_time <= start_time
+        or not valid_capture_text(summary)
+        or not isinstance(transcript, list)
+        or not 0 < len(transcript) <= 500
+        or not isinstance(attachment_references, list)
+        or len(attachment_references) > 5000
+    ):
+        fail("invalid private input")
+
+    source_guids = []
+    previous_timestamp = None
+    transcript_fields = {"sourceGuid", "timestamp", "direction", "body"}
+    for message in transcript:
+        if not isinstance(message, dict) or set(message) != transcript_fields:
+            fail("invalid private input")
+        source_guid = message.get("sourceGuid")
+        timestamp = message.get("timestamp")
+        direction = message.get("direction")
+        body = message.get("body")
+        try:
+            message_time = parse_rfc3339(timestamp)
+        except ValueError:
+            fail("invalid private input")
+        if (
+            not valid_capture_text(source_guid)
+            or not valid_source_guid(source_guid)
+            or source_guid in source_guids
+            or not valid_capture_token(direction)
+            or len(direction.encode("utf-8")) > 64
+            or not valid_capture_text(body, allow_empty=True)
+            or message_time < start_time
+            or message_time >= end_time
+            or (previous_timestamp is not None and message_time < previous_timestamp)
+        ):
+            fail("invalid private input")
+        source_guids.append(source_guid)
+        previous_timestamp = message_time
+
+    source_guid_set = set(source_guids)
+    attachment_fields = {"sourceGuid", "name", "mimeType", "sizeBytes"}
+    for attachment in attachment_references:
+        if not isinstance(attachment, dict) or set(attachment) != attachment_fields:
+            fail("invalid private input")
+        source_guid = attachment.get("sourceGuid")
+        name = attachment.get("name")
+        mime_type = attachment.get("mimeType")
+        size_bytes = attachment.get("sizeBytes")
+        if (
+            source_guid not in source_guid_set
+            or not valid_capture_token(name)
+            or "/" in name
+            or "\\" in name
+            or not valid_capture_token(mime_type)
+            or not isinstance(size_bytes, int)
+            or isinstance(size_bytes, bool)
+            or size_bytes < 0
+        ):
+            fail("invalid private input")
+
+    value["contactName"] = contact_name.strip()
+    value["phone"] = normalized_phone(phone)
+    value["sourceGuids"] = source_guids
+    return value
+
+
+def format_capture_comment(capture, contact_id):
+    capture_identity = {
+        "version": 1,
+        "contactId": contact_id,
+        "start": capture["start"],
+        "end": capture["end"],
+        "sourceGuids": capture["sourceGuids"],
+    }
+    identity_json = json.dumps(
+        capture_identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    capture_id = hashlib.sha256(identity_json).hexdigest()
+    metadata = json.dumps(
+        {"captureId": capture_id, "sourceGuids": capture["sourceGuids"]},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    sections = [
+        "Logged from a personal phone conversation.",
+        f"Capture Window\nStart: {capture['start']}\nEnd: {capture['end']}",
+        f"Capture Summary\n{capture['summary']}",
+    ]
+    transcript_lines = ["Transcript"]
+    for index, message in enumerate(capture["transcript"], start=1):
+        transcript_lines.append(
+            f"Message {index} — {message['timestamp']} — {message['direction']}\n{message['body']}"
+        )
+    sections.append("\n\n".join(transcript_lines))
+
+    message_numbers = {
+        message["sourceGuid"]: index
+        for index, message in enumerate(capture["transcript"], start=1)
+    }
+    attachment_lines = ["Attachment References"]
+    if capture["attachmentReferences"]:
+        attachment_lines.extend(
+            (
+                f"- Message {message_numbers[item['sourceGuid']]}: {item['name']} "
+                f"({item['mimeType']}, {item['sizeBytes']} bytes)"
+            )
+            for item in capture["attachmentReferences"]
+        )
+    else:
+        attachment_lines.append("None")
+    sections.append("\n".join(attachment_lines))
+    sections.append(f"{CAPTURE_METADATA_START}\n{metadata}\n{CAPTURE_METADATA_END}")
+    body = "\n\n".join(sections)
+    if len(body.encode("utf-8")) > CAPTURE_COMMENT_MAX_BYTES:
+        fail("formatted comment exceeds 8 MiB ceiling")
+    return body
+
+
+def log_capture(args):
+    capture = read_log_capture_input()
+    contact = resolve_logged_messages_contact(capture["contactName"], capture["phone"])
+    conversation = resolve_logged_messages_conversation(contact)
+    body = format_capture_comment(capture, contact["id"])
+    if not args.yes:
+        print_json(
+            {
+                "dryRun": True,
+                "operation": "create one private Conversation Internal Comment",
+                "message": "Re-run with --yes to execute.",
+            }
+        )
+        return
+    created = request(
+        "POST",
+        "/conversations/messages",
+        body={
+            "type": "InternalComment",
+            "contactId": contact["id"],
+            "message": body,
+            "status": "delivered",
+            "mentions": [],
+        },
+        yes=True,
+        version=CONVERSATION_MESSAGES_VERSION,
+        sanitize_errors=True,
+    )
+    if (
+        not isinstance(created, dict)
+        or created.get("conversationId") != conversation["id"]
+        or not valid_provider_id(created.get("messageId"))
+    ):
+        fail("internal comment write failed")
+    message_id = created["messageId"]
+    readback = request(
+        "GET",
+        f"/conversations/messages/{message_id}",
+        version=CONVERSATION_MESSAGES_VERSION,
+        sanitize_errors=True,
+    )
+    message = readback.get("message") if isinstance(readback, dict) else None
+    expected_hash = hashlib.sha256(body.encode("utf-8")).digest()
+    if (
+        not isinstance(message, dict)
+        or message.get("id") != message_id
+        or message.get("contactId") != contact["id"]
+        or message.get("conversationId") != conversation["id"]
+        or message.get("messageType") != "TYPE_INTERNAL_COMMENT"
+        or message.get("status") != "delivered"
+        or not isinstance(message.get("body"), str)
+        or hashlib.sha256(message["body"].encode("utf-8")).digest() != expected_hash
+    ):
+        fail("internal comment verification failed")
+    print_json({"created": True, "verified": True})
+
+
 def conversation_messages(args):
     data = request(
         "GET",
@@ -1212,13 +1473,15 @@ Tasks:
 Users (read-only):
 - List: ghl users list
 
-Conversations (read-only):
+Conversations (reads plus one fixed private write):
 - Search by contact: ghl conversations search --contact-id CONTACT_ID
 - Search by text: ghl conversations search --query "{contact_query}" --limit 20
 - Thread messages: ghl conversations messages CONVERSATION_ID --limit 50
 - Full email body: ghl conversations email EMAIL_MESSAGE_ID
 - Logged-message overlap: ghl conversations logged-messages (private JSON via stdin; never command arguments)
-- Conversations are read-only in this CLI: no send, reply, update, or delete exists, by policy.
+- Dry-run Internal Comment: ghl conversations log-capture (private JSON via stdin; never command arguments)
+- Execute after Log Approval: ghl --yes conversations log-capture (private JSON via stdin)
+- This fixed private Internal Comment is the only Conversation write exception; no generic send, reply, update, or delete exists.
 
 Recurring value rule:
 - Monthly recurring opportunity value = expected first-year revenue.
@@ -1488,7 +1751,10 @@ def build_parser():
     users_sub = users.add_subparsers(dest="users_command", required=True)
     users_sub.add_parser("list").set_defaults(func=list_users)
 
-    convos = sub.add_parser("conversations", help="read-only access to captured conversations")
+    convos = sub.add_parser(
+        "conversations",
+        help="read access plus one guarded private Internal Comment write",
+    )
     convos_sub = convos.add_subparsers(dest="conversations_command", required=True)
     convo_search = convos_sub.add_parser("search")
     convo_search.add_argument("--contact-id")
@@ -1506,6 +1772,10 @@ def build_parser():
         "logged-messages",
         help="check private source identifiers from stdin against logged captures",
     ).set_defaults(func=logged_messages)
+    convos_sub.add_parser(
+        "log-capture",
+        help="create one guarded private Internal Comment from strict JSON on stdin",
+    ).set_defaults(func=log_capture)
 
     cleanup = sub.add_parser("cleanup")
     cleanup_sub = cleanup.add_subparsers(dest="cleanup_command", required=True)

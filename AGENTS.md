@@ -138,12 +138,13 @@ ghl --yes tasks delete TASK_ID --contact-id CONTACT_ID --confirm-delete TASK_ID
 Task search shows every returned record and reports unlinked records. Use
 `--exclude-unlinked` only for a filtered operational view.
 
-## Conversations (read-only)
+## Conversations (reads plus one fixed private write)
 
 The email connector captures inbound and outbound customer email into GHL
-conversations. This CLI exposes them read-only; no send, reply, update, or delete
-subcommand exists, by policy. Requires `conversations.readonly` and
-`conversations/message.readonly` token scopes.
+conversations. Reads require `conversations.readonly` and
+`conversations/message.readonly`. The guarded Internal Comment below is the only
+Conversation write exception and requires `conversations/message.write`; no
+generic send, reply, update, or delete subcommand exists.
 
 ```sh
 ghl conversations search --contact-id CONTACT_ID
@@ -151,11 +152,21 @@ ghl conversations search --query "Example Co" --limit 20
 ghl conversations messages CONVERSATION_ID --limit 50
 ghl conversations email EMAIL_MESSAGE_ID
 ghl conversations logged-messages # reads contactName, phone, and sourceGuids as private JSON on stdin
+ghl conversations log-capture # dry run; reads the approved private capture JSON on stdin
+ghl --yes conversations log-capture # execute only after Log Approval
 ```
 
 `logged-messages` resolves exactly one matching Contact and existing Conversation,
 then reports `none`, `exact`, `partial`, or fail-closed `indeterminate` overlap.
 Never put its private stdin fields in command arguments, URLs, or logs.
+
+`log-capture` accepts exactly `contactName`, `phone`, `start`, `end`, `summary`,
+`transcript`, and `attachmentReferences` as private JSON on stdin. It derives the
+fixed Internal Comment, source GUID order, and capture ID, hides the body during
+dry run, and verifies an executed write by ID. Never place its input in command
+arguments, durable files, URLs, or logs. It cannot select another message type,
+mention a teammate, truncate, split, attach, schedule, or send customer-facing
+content.
 
 ## Tests
 

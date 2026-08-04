@@ -101,9 +101,10 @@ Security:
 
 - Do not commit the token.
 - Do not print the token in chat, logs, shell history, or docs.
-- Prefer least privilege. Do not enable payments, email-send, social, calendars,
-  invoices, websites, courses, phone numbers, workflows, or AI-agent permissions
-  for this CLI. Conversations permissions are read-only only.
+- Prefer least privilege. Do not enable payments, unrelated email-send, social,
+  calendars, invoices, websites, courses, phone numbers, workflows, or AI-agent
+  permissions for this CLI. The one Conversations write scope is limited by the
+  CLI to the guarded private Internal Comment operation documented below.
 
 Recommended steady-state permissions:
 
@@ -121,7 +122,8 @@ Recommended steady-state permissions:
   "locations/tasks.readonly",
   "users.readonly",
   "conversations.readonly",
-  "conversations/message.readonly"
+  "conversations/message.readonly",
+  "conversations/message.write"
 ]
 ```
 
@@ -130,9 +132,9 @@ Notes:
 - Enable both read and write for contacts/opportunities/tags because the CLI
   searches before it writes.
 - `pipelines.readonly` is needed to resolve pipeline and stage ids by name.
-- The conversations scopes are read-only on purpose: `ghl conversations` reads
-  connector-captured email threads and has no send/reply/update/delete. Do not
-  add `conversations/message.write`.
+- The Conversations message write scope is used only by the fixed guarded
+  `conversations log-capture` Internal Comment operation. The CLI exposes no
+  generic send/reply/update/delete or customer-facing message write.
 - `locations/customFields.readonly` is needed to map field names to ids.
 - `locations/customFields.write` is needed for setup or repair of CRM fields.
 - `locations/tasks.readonly` is needed to read the dated contact follow-up backlog.
@@ -182,6 +184,7 @@ ghl --yes contacts dnd CONTACT_ID --channel Email --status active
 ghl --yes tasks create --contact-id CONTACT_ID --title "Follow up" --body "Context" --due 2026-07-14T09:00:00-04:00 --assigned-to USER_ID
 ghl --yes tasks update TASK_ID --contact-id CONTACT_ID --due 2026-07-20T09:00:00-04:00
 ghl --yes tasks complete TASK_ID --contact-id CONTACT_ID
+ghl --yes conversations log-capture # approved private capture JSON via stdin
 ```
 
 Deletes require an extra confirmation matching the record id:
@@ -195,7 +198,15 @@ ghl --yes tasks delete TASK_ID --contact-id CONTACT_ID --confirm-delete TASK_ID
 Task search shows every returned record and reports unlinked records. Add
 `--exclude-unlinked` for a filtered operational view.
 
-Do not add outbound messaging, payment, or social-posting commands to this CLI.
+Do not add customer-facing or generic Conversation messaging, payment, or
+social-posting commands to this CLI. The fixed guarded `log-capture` private
+Internal Comment is the only Conversation write exception.
+
+`conversations log-capture` accepts exactly `contactName`, `phone`, `start`,
+`end`, `summary`, `transcript`, and `attachmentReferences` as private JSON on
+stdin. It derives the complete fixed Internal Comment and final capture metadata,
+defaults to a body-free dry run, and verifies an executed write by returned ID.
+Never place its private input in command arguments, durable files, URLs, or logs.
 
 `contacts create` is the explicit creation path. Unlike `contacts upsert`, it
 does not intentionally select an existing contact through the location's
