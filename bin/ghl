@@ -38,6 +38,8 @@ _DOTENV = None
 PRIVATE_INPUT_MAX_BYTES = 1024 * 1024
 CAPTURE_PRIVATE_INPUT_MAX_BYTES = 32 * 1024 * 1024
 CAPTURE_COMMENT_MAX_BYTES = 8 * 1024 * 1024
+INTERNAL_COMMENT_PAGE_SIZE = 100
+INTERNAL_COMMENT_MAX_PAGES = 1000
 CAPTURE_METADATA_START = "--- message-monitor:v1 ---"
 CAPTURE_METADATA_END = "--- end-message-monitor ---"
 
@@ -46,9 +48,28 @@ class CaptureMetadataError(ValueError):
     pass
 
 
+class UntrustedJsonError(ValueError):
+    pass
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, _request, _file, _code, _message, _headers, _new_url):
+        return None
+
+
+HTTP_OPENER = urllib.request.build_opener(NoRedirectHandler)
+
+
 def fail(message, code=1):
     print(f"error: {message}", file=sys.stderr)
     raise SystemExit(code)
+
+
+def parse_untrusted_json(raw):
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError) as exc:
+        raise UntrustedJsonError from exc
 
 
 def candidate_roots():
@@ -137,10 +158,15 @@ def api_base_url():
     override = os.environ.get("GHL_TEST_BASE_URL")
     if not override:
         return BASE_URL
-    parsed = urllib.parse.urlsplit(override)
+    try:
+        parsed = urllib.parse.urlsplit(override)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
+        fail("invalid test API endpoint")
     if (
         parsed.scheme != "http"
-        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or hostname not in {"127.0.0.1", "localhost", "::1"}
         or parsed.username
         or parsed.password
         or parsed.path not in {"", "/"}
@@ -148,6 +174,10 @@ def api_base_url():
         or parsed.fragment
     ):
         fail("invalid test API endpoint")
+    if not os.environ.get("GHL_LOCATION_ID") or not os.environ.get(
+        "GHL_PRIVATE_INTEGRATION_TOKEN"
+    ):
+        fail("test API endpoint requires explicit credentials")
     return override.rstrip("/")
 
 
@@ -245,7 +275,7 @@ def request(
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with HTTP_OPENER.open(req) as resp:
             try:
                 raw = resp.read().decode("utf-8")
             except UnicodeDecodeError:
@@ -255,8 +285,8 @@ def request(
             if not raw:
                 return {}
             try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
+                return parse_untrusted_json(raw)
+            except UntrustedJsonError:
                 if sanitize_errors:
                     fail("GHL response was invalid")
                 raise
@@ -817,8 +847,8 @@ def read_private_json_input(max_bytes):
     if len(raw) > max_bytes:
         fail("private input is too large")
     try:
-        return json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        return parse_untrusted_json(raw)
+    except UntrustedJsonError:
         fail("invalid private input")
 
 
@@ -870,7 +900,11 @@ def valid_source_guids(values):
 
 
 def contact_names(contact):
-    names = {contact.get("name"), contact.get("contactName")}
+    names = {
+        value
+        for value in (contact.get("name"), contact.get("contactName"))
+        if isinstance(value, str)
+    }
     combined = " ".join(
         part.strip()
         for part in (contact.get("firstName"), contact.get("lastName"))
@@ -915,7 +949,7 @@ def resolve_logged_messages_contact(contact_name, selected_phone):
         if not isinstance(page_contacts, list) or any(not isinstance(item, dict) for item in page_contacts):
             fail("contact resolution failed")
         page_ids = [item.get("id") for item in page_contacts]
-        if any(not isinstance(item_id, str) or not item_id for item_id in page_ids):
+        if any(not valid_provider_id(item_id) for item_id in page_ids):
             fail("contact resolution failed")
         if seen_ids.intersection(page_ids) or len(set(page_ids)) != len(page_ids):
             fail("contact resolution failed")
@@ -963,8 +997,7 @@ def resolve_logged_messages_conversation(contact):
         or not isinstance(conversations[0], dict)
         or conversations[0].get("contactId") != contact["id"]
         or conversations[0].get("locationId") != expected_location
-        or not isinstance(conversations[0].get("id"), str)
-        or not conversations[0]["id"]
+        or not valid_provider_id(conversations[0].get("id"))
     ):
         fail("conversation resolution failed")
     return conversations[0]
@@ -975,8 +1008,15 @@ def read_internal_comments(contact, conversation):
     comments = []
     seen_cursors = set()
     cursor = None
+    page_count = 0
     while True:
-        query = {"limit": 100, "type": "TYPE_INTERNAL_COMMENTS"}
+        if page_count >= INTERNAL_COMMENT_MAX_PAGES:
+            fail("internal comment history unavailable")
+        page_count += 1
+        query = {
+            "limit": INTERNAL_COMMENT_PAGE_SIZE,
+            "type": "TYPE_INTERNAL_COMMENTS",
+        }
         if cursor is not None:
             query["lastMessageId"] = cursor
         data = request(
@@ -994,6 +1034,7 @@ def read_internal_comments(contact, conversation):
         if (
             not isinstance(page_messages, list)
             or any(not isinstance(message, dict) for message in page_messages)
+            or len(page_messages) > INTERNAL_COMMENT_PAGE_SIZE
             or not isinstance(next_page, bool)
         ):
             fail("internal comment history unavailable")
@@ -1032,8 +1073,8 @@ def parse_capture_metadata(body):
     if not match:
         raise CaptureMetadataError
     try:
-        metadata = json.loads(match.group(1))
-    except json.JSONDecodeError:
+        metadata = parse_untrusted_json(match.group(1))
+    except UntrustedJsonError:
         raise CaptureMetadataError
     if not isinstance(metadata, dict) or set(metadata) != {"captureId", "sourceGuids"}:
         raise CaptureMetadataError
@@ -1119,6 +1160,15 @@ def valid_provider_id(value):
     return isinstance(value, str) and bool(
         re.fullmatch(r"[A-Za-z0-9_-]{1,256}", value)
     )
+
+
+def sha256_utf8(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        return hashlib.sha256(value.encode("utf-8")).digest()
+    except UnicodeEncodeError:
+        return None
 
 
 def read_log_capture_input():
@@ -1314,7 +1364,7 @@ def log_capture(args):
         sanitize_errors=True,
     )
     message = readback.get("message") if isinstance(readback, dict) else None
-    expected_hash = hashlib.sha256(body.encode("utf-8")).digest()
+    expected_hash = sha256_utf8(body)
     if (
         not isinstance(message, dict)
         or message.get("id") != message_id
@@ -1322,8 +1372,7 @@ def log_capture(args):
         or message.get("conversationId") != conversation["id"]
         or message.get("messageType") != "TYPE_INTERNAL_COMMENT"
         or message.get("status") != "delivered"
-        or not isinstance(message.get("body"), str)
-        or hashlib.sha256(message["body"].encode("utf-8")).digest() != expected_hash
+        or sha256_utf8(message.get("body")) != expected_hash
     ):
         fail("internal comment verification failed")
     print_json({"created": True, "verified": True})
