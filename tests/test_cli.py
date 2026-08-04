@@ -2151,6 +2151,37 @@ class GhlCliTests(unittest.TestCase):
             },
         )
 
+    def test_opportunity_search_all_accepts_string_start_after_cursor(self):
+        pages = [
+            {
+                "opportunities": [
+                    {"id": f"opp-{index}"} for index in range(100)
+                ],
+                "meta": {
+                    "total": 101,
+                    "startAfter": "1720000000000",
+                    "startAfterId": "opp-99",
+                },
+            },
+            {
+                "opportunities": [{"id": "opp-100"}],
+                "meta": {"total": 101},
+            },
+        ]
+
+        result, requests = self.run_cli_with_provider(
+            lambda _path, _query: pages.pop(0),
+            "opportunities",
+            "search",
+            "--all",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)["opportunities"]), 101)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[1][1]["startAfter"], "1720000000000")
+        self.assertEqual(requests[1][1]["startAfterId"], "opp-99")
+
     def test_opportunity_search_all_fetches_after_exactly_full_page(self):
         pages = [
             {
@@ -2497,6 +2528,35 @@ class GhlCliTests(unittest.TestCase):
                     {"id": f"opp-{page_number}-{index}"} for index in range(100)
                 ],
                 "meta": cursor,
+            }
+
+        result, requests = self.run_cli_with_provider(
+            responder,
+            "opportunities",
+            "search",
+            "--all",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("repeated its pagination cursor", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(requests), 2)
+
+    def test_opportunity_search_all_rejects_cross_type_repeated_cursor(self):
+        page_number = 0
+
+        def responder(_path, _query):
+            nonlocal page_number
+            page_number += 1
+            start_after = 1720000000000 if page_number % 2 else "1720000000000"
+            return {
+                "opportunities": [
+                    {"id": f"opp-{page_number}-{index}"} for index in range(100)
+                ],
+                "meta": {
+                    "startAfter": start_after,
+                    "startAfterId": "opp-boundary",
+                },
             }
 
         result, requests = self.run_cli_with_provider(

@@ -627,6 +627,9 @@ def validate_opportunity_search_cursor(meta, page_number):
         isinstance(start_after, (int, float))
         and not isinstance(start_after, bool)
         and math.isfinite(start_after)
+    ) or (
+        isinstance(start_after, str)
+        and re.fullmatch(r"[0-9]+", start_after) is not None
     )
     if not valid_timestamp or not isinstance(start_after_id, str) or not start_after_id:
         raise OpportunityPaginationError(
@@ -714,7 +717,14 @@ def paginate_opportunity_search(fetch_page):
             break
 
         cursor = validate_opportunity_search_cursor(meta, page_number)
-        cursor_key = (cursor["startAfter"], cursor["startAfterId"])
+        cursor_start_after = cursor["startAfter"]
+        if isinstance(cursor_start_after, str):
+            cursor_start_after_key = cursor_start_after.lstrip("0") or "0"
+        elif isinstance(cursor_start_after, float) and cursor_start_after.is_integer():
+            cursor_start_after_key = str(int(cursor_start_after))
+        else:
+            cursor_start_after_key = str(cursor_start_after)
+        cursor_key = (cursor_start_after_key, cursor["startAfterId"])
         if cursor_key in seen_cursors:
             raise OpportunityPaginationError(
                 f"opportunity search page {page_number} repeated its pagination cursor"
