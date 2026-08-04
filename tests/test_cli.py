@@ -5,13 +5,12 @@ import json
 import os
 import runpy
 import subprocess
-import sys
 import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+import urllib.parse
 import unittest
-from urllib.parse import parse_qs, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,85 +26,200 @@ def clean_env(tmpdir):
     return env
 
 
+class SyntheticGhlServer:
+    def __init__(self, callback):
+        self.callback = callback
+        self.requests = []
+
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.handle_request()
+
+            def do_POST(self):
+                self.handle_request()
+
+            def handle_request(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                raw_body = self.rfile.read(length) if length else b""
+                body = json.loads(raw_body) if raw_body else None
+                parsed = urllib.parse.urlsplit(self.path)
+                query = urllib.parse.parse_qs(parsed.query)
+                request = {
+                    "method": self.command,
+                    "path": parsed.path,
+                    "query": query,
+                    "body": body,
+                    "version": self.headers.get("Version"),
+                }
+                owner.requests.append(request)
+                response = owner.callback(request)
+                status, payload = response[:2]
+                response_headers = response[2] if len(response) == 3 else {}
+                encoded = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                for name, value in response_headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, _format, *_args):
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def url(self):
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_args):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+
 class GhlCliTests(unittest.TestCase):
-    def run_cli(self, *args, cwd=None, env=None):
+    def run_cli(self, *args, cwd=None, env=None, input_text=None):
         return subprocess.run(
             [str(CLI), *args],
             cwd=cwd or ROOT,
             env=env,
             text=True,
+            input=input_text,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
         )
 
     def run_cli_with_provider(self, responder, *args):
-        requests = []
+        def normalized_query(request):
+            return {
+                key: values[0] if len(values) == 1 else values
+                for key, values in request["query"].items()
+            }
 
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                parsed = urlparse(self.path)
-                query = {
-                    key: values[0] if len(values) == 1 else values
-                    for key, values in parse_qs(
-                        parsed.query, keep_blank_values=True
-                    ).items()
-                }
-                requests.append((parsed.path, query))
-                response = responder(parsed.path, query)
-                if isinstance(response, tuple):
-                    status, payload = response
-                else:
-                    status, payload = 200, response
-                body = json.dumps(payload).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+        def respond(request):
+            response = responder(request["path"], normalized_query(request))
+            return response if isinstance(response, tuple) else (200, response)
 
-            def log_message(self, _format, *_args):
-                pass
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
+        with SyntheticGhlServer(respond) as server:
             with tempfile.TemporaryDirectory() as tmp:
-                env = clean_env(tmp)
+                env = self.synthetic_env(tmp, server)
                 env["GHL_LOCATION_ID"] = "synthetic-location"
-                env["GHL_PRIVATE_INTEGRATION_TOKEN"] = "synthetic-token"
-                runner = """
-import runpy
-import sys
-
-cli_path = sys.argv.pop(1)
-base_url = sys.argv.pop(1)
-module = runpy.run_path(cli_path)
-module["request"].__globals__["BASE_URL"] = base_url
-module["main"]()
-"""
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-c",
-                        runner,
-                        str(CLI),
-                        f"http://127.0.0.1:{server.server_port}",
-                        *args,
-                    ],
-                    cwd=tmp,
-                    env=env,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                )
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join()
+                result = self.run_cli(*args, cwd=tmp, env=env)
+        requests = [
+            (request["path"], normalized_query(request))
+            for request in server.requests
+        ]
         return result, requests
+
+    def synthetic_env(self, tmp, server):
+        env = clean_env(tmp)
+        env["GHL_LOCATION_ID"] = "location-synthetic"
+        env["GHL_PRIVATE_INTEGRATION_TOKEN"] = "token-synthetic"
+        env["GHL_TEST_BASE_URL"] = server.url
+        return env
+
+    def run_logged_messages_fixture(self, tmp, comments, source_guids):
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": "Synthetic Person",
+                            "phone": "2025550101",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/search":
+                return 200, {
+                    "conversations": [
+                        {
+                            "id": "conversation-synthetic",
+                            "contactId": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/conversation-synthetic/messages":
+                return 200, {
+                    "messages": {
+                        "lastMessageId": "message-final",
+                        "nextPage": False,
+                        "messages": [
+                            {
+                                "id": f"comment-{index}",
+                                "messageType": "TYPE_INTERNAL_COMMENT",
+                                "contactId": "contact-synthetic",
+                                "locationId": "location-synthetic",
+                                "conversationId": "conversation-synthetic",
+                                "body": body,
+                            }
+                            for index, body in enumerate(comments)
+                        ],
+                    }
+                }
+            return 404, {"message": "synthetic route not found"}
+
+        with SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "2025550101",
+                        "sourceGuids": source_guids,
+                    }
+                ),
+            )
+        return result, server.requests
+
+    def log_capture_input(self, **overrides):
+        value = {
+            "contactName": "Synthetic Person",
+            "phone": "2025550101",
+            "start": "2026-08-03T13:00:00Z",
+            "end": "2026-08-03T14:00:00Z",
+            "summary": "Synthetic private summary",
+            "transcript": [
+                {
+                    "sourceGuid": "synthetic-guid-a",
+                    "timestamp": "2026-08-03T13:15:00Z",
+                    "direction": "incoming",
+                    "body": "Synthetic private body",
+                },
+                {
+                    "sourceGuid": "synthetic-guid-b",
+                    "timestamp": "2026-08-03T13:30:00Z",
+                    "direction": "outgoing",
+                    "body": "Synthetic private response",
+                },
+            ],
+            "attachmentReferences": [
+                {
+                    "sourceGuid": "synthetic-guid-a",
+                    "name": "synthetic-private.txt",
+                    "mimeType": "text/plain",
+                    "sizeBytes": 42,
+                }
+            ],
+        }
+        value.update(overrides)
+        return value
 
     def test_version_and_help(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -364,6 +478,1567 @@ module["main"]()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing GHL_LOCATION_ID", result.stderr)
         self.assertNotIn("dryRun", result.stdout)
+
+    def test_logged_messages_resolves_exact_contact_and_conversation_without_overlap(self):
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": "Synthetic Person",
+                            "phone": "+1 (202) 555-0101",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/search":
+                return 200, {
+                    "conversations": [
+                        {
+                            "id": "conversation-synthetic",
+                            "contactId": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/conversation-synthetic/messages":
+                return 200, {
+                    "messages": {
+                        "lastMessageId": "",
+                        "nextPage": False,
+                        "messages": [],
+                    }
+                }
+            return 404, {"message": "synthetic route not found"}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "202-555-0101",
+                        "sourceGuids": ["synthetic-guid-a", "synthetic-guid-b"],
+                    }
+                ),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"overlap": False, "classification": "none"},
+        )
+        self.assertEqual(server.requests[0]["method"], "POST")
+        self.assertEqual(server.requests[0]["body"]["query"], "Synthetic Person")
+        self.assertEqual(
+            server.requests[2]["query"],
+            {"limit": ["100"], "type": ["TYPE_INTERNAL_COMMENTS"]},
+        )
+
+    def test_logged_messages_reads_all_contact_search_pages_before_resolving(self):
+        first_page = [
+            {
+                "id": f"other-contact-{index}",
+                "name": "Other Synthetic Person",
+                "phone": f"202555{1000 + index:04d}",
+            }
+            for index in range(99)
+        ]
+        first_page.append(
+            {
+                "id": "contact-first",
+                "name": "Synthetic Person",
+                "phone": "2025550101",
+            }
+        )
+
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                if request["body"]["page"] == 1:
+                    return 200, {"contacts": first_page}
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-second",
+                            "name": "Synthetic Person",
+                            "phone": "+1 202 555 0101",
+                        }
+                    ]
+                }
+            return 500, {"private": "provider details must be hidden"}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "202-555-0101",
+                        "sourceGuids": ["synthetic-guid-a"],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "error: contact resolution failed\n")
+        self.assertEqual(
+            [request["body"]["page"] for request in server.requests],
+            [1, 2],
+        )
+
+    def test_logged_messages_rejects_contact_from_another_location(self):
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "other-location",
+                            "name": "Synthetic Person",
+                            "additionalPhones": [{"phone": "+1 202 555 0101"}],
+                        }
+                    ]
+                }
+            return 200, {
+                "conversations": [
+                    {
+                        "id": "conversation-synthetic",
+                        "contactId": "contact-synthetic",
+                        "locationId": "location-synthetic",
+                    }
+                ]
+            }
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "202-555-0101",
+                        "sourceGuids": ["synthetic-guid-a"],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "error: contact resolution failed\n")
+        self.assertEqual(len(server.requests), 1)
+
+    def test_logged_messages_rejects_truncated_or_ambiguous_conversation_search(self):
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": "Synthetic Person",
+                            "phone": "2025550101",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/search":
+                return 200, {
+                    "total": 2,
+                    "conversations": [
+                        {
+                            "id": "conversation-synthetic",
+                            "contactId": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                        }
+                    ],
+                }
+            return 500, {"private": "provider details must be hidden"}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "2025550101",
+                        "sourceGuids": ["synthetic-guid-a"],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "error: conversation resolution failed\n")
+        self.assertEqual(len(server.requests), 2)
+
+    def test_logged_messages_paginates_nested_internal_comment_envelope(self):
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": "Synthetic Person",
+                            "phone": "2025550101",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/search":
+                return 200, {
+                    "conversations": [
+                        {
+                            "id": "conversation-synthetic",
+                            "contactId": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/conversation-synthetic/messages":
+                if "lastMessageId" not in request["query"]:
+                    return 200, {
+                        "messages": {
+                            "lastMessageId": "message-cursor",
+                            "nextPage": True,
+                            "messages": [
+                                {
+                                    "id": "message-non-comment",
+                                    "messageType": "TYPE_SMS",
+                                    "body": (
+                                        "--- message-monitor:v1 ---\n"
+                                        '{"captureId":"' + "9" * 64
+                                        + '","sourceGuids":["synthetic-guid-a"]}\n'
+                                        "--- end-message-monitor ---"
+                                    ),
+                                },
+                                {
+                                    "id": "message-comment-one",
+                                    "messageType": "TYPE_INTERNAL_COMMENT",
+                                    "contactId": "contact-synthetic",
+                                    "locationId": "location-synthetic",
+                                    "conversationId": "conversation-synthetic",
+                                    "body": "ordinary synthetic comment",
+                                },
+                            ],
+                        }
+                    }
+                return 200, {
+                    "messages": {
+                        "lastMessageId": "message-final",
+                        "nextPage": False,
+                        "messages": [
+                            {
+                                "id": "message-comment-two",
+                                "messageType": "TYPE_INTERNAL_COMMENT",
+                                "contactId": "contact-synthetic",
+                                "locationId": "location-synthetic",
+                                "conversationId": "conversation-synthetic",
+                                "body": "another ordinary synthetic comment",
+                            }
+                        ],
+                    }
+                }
+            return 404, {"message": "synthetic route not found"}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "2025550101",
+                        "sourceGuids": ["synthetic-guid-a"],
+                    }
+                ),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"overlap": False, "classification": "none"},
+        )
+        message_requests = [
+            request for request in server.requests if request["path"].endswith("/messages")
+        ]
+        self.assertEqual(len(message_requests), 2)
+        self.assertEqual(message_requests[1]["query"]["lastMessageId"], ["message-cursor"])
+        self.assertEqual(
+            message_requests[1]["query"]["type"],
+            ["TYPE_INTERNAL_COMMENTS"],
+        )
+
+    def test_logged_messages_bounds_fresh_cursor_pagination(self):
+        message_page = 0
+
+        def respond(request):
+            nonlocal message_page
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": "Synthetic Person",
+                            "phone": "2025550101",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/search":
+                return 200, {
+                    "conversations": [
+                        {
+                            "id": "conversation-synthetic",
+                            "contactId": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/conversation-synthetic/messages":
+                message_page += 1
+                return 200, {
+                    "messages": {
+                        "lastMessageId": f"fresh-cursor-{message_page}",
+                        "nextPage": message_page <= 1000,
+                        "messages": [],
+                    }
+                }
+            return 404, {"message": "synthetic route not found"}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "2025550101",
+                        "sourceGuids": ["synthetic-guid-a"],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "error: internal comment history unavailable\n")
+        self.assertEqual(message_page, 1000)
+
+    def test_logged_messages_rejects_provider_pages_over_the_requested_limit(self):
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": "Synthetic Person",
+                            "phone": "2025550101",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/search":
+                return 200, {
+                    "conversations": [
+                        {
+                            "id": "conversation-synthetic",
+                            "contactId": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/conversation-synthetic/messages":
+                return 200, {
+                    "messages": {
+                        "lastMessageId": "cursor-synthetic",
+                        "nextPage": False,
+                        "messages": [{} for _index in range(101)],
+                    }
+                }
+            return 404, {"message": "synthetic route not found"}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "2025550101",
+                        "sourceGuids": ["synthetic-guid-a"],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "error: internal comment history unavailable\n")
+
+    def test_logged_messages_fails_closed_on_contact_cardinality_and_phone_resolution(self):
+        cases = {
+            "zero": [],
+            "unresolved-phone": [
+                {
+                    "id": "contact-synthetic",
+                    "locationId": "location-synthetic",
+                    "name": "Synthetic Person",
+                    "phone": "2025550199",
+                }
+            ],
+            "multiple": [
+                {
+                    "id": f"contact-synthetic-{index}",
+                    "locationId": "location-synthetic",
+                    "name": "Synthetic Person",
+                    "phone": "2025550101",
+                }
+                for index in range(2)
+            ],
+            "invalid-id": [
+                {
+                    "id": "private-contact\nforged",
+                    "locationId": "location-synthetic",
+                    "name": "Synthetic Person",
+                    "phone": "2025550101",
+                }
+            ],
+            "invalid-name-type": [
+                {
+                    "id": "contact-synthetic",
+                    "locationId": "location-synthetic",
+                    "name": ["Synthetic Person"],
+                    "phone": "2025550101",
+                }
+            ],
+        }
+        for name, contacts in cases.items():
+            with self.subTest(name=name):
+                def respond(request):
+                    if request["path"] == "/contacts/search":
+                        return 200, {"contacts": contacts}
+                    return 500, {"private": "must not be returned"}
+
+                with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+                    result = self.run_cli(
+                        "conversations",
+                        "logged-messages",
+                        cwd=tmp,
+                        env=self.synthetic_env(tmp, server),
+                        input_text=json.dumps(
+                            {
+                                "contactName": "Synthetic Person",
+                                "phone": "2025550101",
+                                "sourceGuids": ["synthetic-guid-a"],
+                            }
+                        ),
+                    )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, "error: contact resolution failed\n")
+                self.assertNotIn("private-contact", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(len(server.requests), 1)
+
+    def test_private_commands_fail_closed_on_non_list_additional_phones(self):
+        command_inputs = {
+            "logged-messages": {
+                "contactName": "Synthetic Person",
+                "phone": "2025550101",
+                "sourceGuids": ["synthetic-guid-a"],
+            },
+            "log-capture": self.log_capture_input(),
+        }
+        for value_name, additional_phones in {
+            "integer": 42,
+            "boolean": True,
+        }.items():
+            for command, private_input in command_inputs.items():
+                with self.subTest(value=value_name, command=command):
+                    def respond(request):
+                        if request["path"] == "/contacts/search":
+                            return 200, {
+                                "contacts": [
+                                    {
+                                        "id": "contact-synthetic",
+                                        "locationId": "location-synthetic",
+                                        "name": "Synthetic Person",
+                                        "phone": "2025550101",
+                                        "additionalPhones": additional_phones,
+                                    }
+                                ]
+                            }
+                        return 500, {"private": "must not be returned"}
+
+                    with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(
+                        respond
+                    ) as server:
+                        result = self.run_cli(
+                            "conversations",
+                            command,
+                            cwd=tmp,
+                            env=self.synthetic_env(tmp, server),
+                            input_text=json.dumps(private_input),
+                        )
+
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(
+                        result.stderr,
+                        "error: contact resolution failed\n",
+                    )
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(len(server.requests), 1)
+
+    def test_logged_messages_fails_closed_on_conversation_cardinality_or_association(self):
+        cases = {
+            "zero": [],
+            "multiple": [
+                {
+                    "id": f"conversation-synthetic-{index}",
+                    "contactId": "contact-synthetic",
+                    "locationId": "location-synthetic",
+                }
+                for index in range(2)
+            ],
+            "wrong-association": [
+                {
+                    "id": "conversation-synthetic",
+                    "contactId": "other-contact",
+                    "locationId": "location-synthetic",
+                }
+            ],
+            "invalid-id": [
+                {
+                    "id": "private-conversation\nforged",
+                    "contactId": "contact-synthetic",
+                    "locationId": "location-synthetic",
+                }
+            ],
+        }
+        for name, conversations in cases.items():
+            with self.subTest(name=name):
+                def respond(request):
+                    if request["path"] == "/contacts/search":
+                        return 200, {
+                            "contacts": [
+                                {
+                                    "id": "contact-synthetic",
+                                    "locationId": "location-synthetic",
+                                    "name": "Synthetic Person",
+                                    "phone": "2025550101",
+                                }
+                            ]
+                        }
+                    if request["path"] == "/conversations/search":
+                        return 200, {"conversations": conversations}
+                    return 500, {"private": "must not be returned"}
+
+                with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+                    result = self.run_cli(
+                        "conversations",
+                        "logged-messages",
+                        cwd=tmp,
+                        env=self.synthetic_env(tmp, server),
+                        input_text=json.dumps(
+                            {
+                                "contactName": "Synthetic Person",
+                                "phone": "2025550101",
+                                "sourceGuids": ["synthetic-guid-a"],
+                            }
+                        ),
+                    )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, "error: conversation resolution failed\n")
+                self.assertNotIn("private-conversation", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(len(server.requests), 2)
+
+    def test_logged_messages_sanitizes_provider_errors_and_never_uses_write_routes(self):
+        private_values = ["2025550101", "synthetic-guid-private", "private provider body"]
+
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": "Synthetic Person",
+                            "phone": private_values[0],
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/search":
+                return 200, {
+                    "conversations": [
+                        {
+                            "id": "conversation-synthetic",
+                            "contactId": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                        }
+                    ]
+                }
+            return 503, {"message": private_values[2], "guid": private_values[1]}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": private_values[0],
+                        "sourceGuids": [private_values[1]],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "error: GHL request failed (HTTP 503)\n")
+        for private_value in private_values:
+            self.assertNotIn(private_value, result.stdout)
+            self.assertNotIn(private_value, result.stderr)
+        self.assertEqual(
+            [(request["method"], request["path"]) for request in server.requests],
+            [
+                ("POST", "/contacts/search"),
+                ("GET", "/conversations/search"),
+                ("GET", "/conversations/conversation-synthetic/messages"),
+            ],
+        )
+
+    def test_logged_messages_sanitizes_malformed_provider_responses(self):
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": "Synthetic Person",
+                            "phone": "2025550101",
+                        }
+                    ]
+                }
+            return 200, b"private malformed provider response"
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "2025550101",
+                        "sourceGuids": ["synthetic-guid-private"],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "error: GHL response was invalid\n")
+        self.assertNotIn("private malformed provider response", result.stderr)
+        self.assertNotIn("synthetic-guid-private", result.stderr)
+
+    def test_logged_messages_sanitizes_provider_json_integer_limit_errors(self):
+        oversized_integer = b'{"private":' + (b"9" * 5000) + b"}"
+
+        def respond(_request):
+            return 200, oversized_integer
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "2025550101",
+                        "sourceGuids": ["synthetic-guid-private"],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "error: GHL response was invalid\n")
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(len(server.requests), 1)
+
+    def test_logged_messages_refuses_cross_origin_provider_redirects(self):
+        def redirected(_request):
+            return 200, {"contacts": []}
+
+        with SyntheticGhlServer(redirected) as redirect_target:
+            def redirect(_request):
+                return 302, {}, {"Location": f"{redirect_target.url}/private-target"}
+
+            with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(redirect) as server:
+                result = self.run_cli(
+                    "conversations",
+                    "logged-messages",
+                    cwd=tmp,
+                    env=self.synthetic_env(tmp, server),
+                    input_text=json.dumps(
+                        {
+                            "contactName": "Synthetic Person",
+                            "phone": "2025550101",
+                            "sourceGuids": ["synthetic-guid-private"],
+                        }
+                    ),
+                )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "error: GHL request failed (HTTP 302)\n")
+        self.assertEqual(len(server.requests), 1)
+        self.assertEqual(redirect_target.requests, [])
+
+    def test_test_endpoint_refuses_credentials_loaded_from_dotenv(self):
+        def respond(_request):
+            return 200, {"contacts": []}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text(
+                "GHL_LOCATION_ID=private-dotenv-location\n"
+                "GHL_PRIVATE_INTEGRATION_TOKEN=private-dotenv-token\n",
+                encoding="utf-8",
+            )
+            env = clean_env(tmp)
+            env["GHL_ENV_FILE"] = str(env_file)
+            env["GHL_TEST_BASE_URL"] = server.url
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=env,
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "2025550101",
+                        "sourceGuids": ["synthetic-guid-private"],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "error: test API endpoint requires explicit credentials\n",
+        )
+        self.assertNotIn("private-dotenv", result.stderr)
+        self.assertEqual(server.requests, [])
+
+    def test_test_endpoint_rejects_an_invalid_port_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = clean_env(tmp)
+            env["GHL_LOCATION_ID"] = "location-synthetic"
+            env["GHL_PRIVATE_INTEGRATION_TOKEN"] = "token-synthetic"
+            env["GHL_TEST_BASE_URL"] = "http://localhost:not-a-port"
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=env,
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "2025550101",
+                        "sourceGuids": ["synthetic-guid-private"],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "error: invalid test API endpoint\n")
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_logged_messages_rejects_private_input_without_echoing_it(self):
+        private_values = ["2025550101", "synthetic-guid-private"]
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=clean_env(tmp),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": private_values[0],
+                        "sourceGuids": [private_values[1], private_values[1]],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "error: invalid private input\n")
+        for private_value in private_values:
+            self.assertNotIn(private_value, result.stdout)
+            self.assertNotIn(private_value, result.stderr)
+
+    def test_private_commands_reject_invalid_utf8_without_traceback(self):
+        for command in ["logged-messages", "log-capture"]:
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as tmp:
+                result = subprocess.run(
+                    [str(CLI), "conversations", command],
+                    cwd=tmp,
+                    env=clean_env(tmp),
+                    input=b'{"private":"\xff"}',
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b"")
+            self.assertEqual(result.stderr, b"error: invalid private input\n")
+            self.assertNotIn(b"Traceback", result.stderr)
+
+    def test_private_commands_reject_oversized_json_integer_without_traceback(self):
+        payload = b'{"phone":' + (b"9" * 5000) + b"}"
+        for command in ["logged-messages", "log-capture"]:
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as tmp:
+                result = subprocess.run(
+                    [str(CLI), "conversations", command],
+                    cwd=tmp,
+                    env=clean_env(tmp),
+                    input=payload,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b"")
+            self.assertEqual(result.stderr, b"error: invalid private input\n")
+            self.assertNotIn(b"Traceback", result.stderr)
+
+    def test_logged_messages_rejects_surrogate_source_guids_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proposed_result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=clean_env(tmp),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "2025550101",
+                        "sourceGuids": ["\ud800"],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(proposed_result.returncode, 0)
+        self.assertEqual(proposed_result.stdout, "")
+        self.assertEqual(proposed_result.stderr, "error: invalid private input\n")
+        self.assertNotIn("Traceback", proposed_result.stderr)
+
+        metadata = json.dumps(
+            {"captureId": "a" * 64, "sourceGuids": ["\ud800"]},
+            separators=(",", ":"),
+        )
+        body = (
+            "--- message-monitor:v1 ---\n"
+            f"{metadata}\n"
+            "--- end-message-monitor ---"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            stored_result, _requests = self.run_logged_messages_fixture(
+                tmp,
+                [body],
+                ["synthetic-guid-a"],
+            )
+
+        self.assertEqual(stored_result.returncode, 0, stored_result.stderr)
+        self.assertEqual(
+            json.loads(stored_result.stdout),
+            {"overlap": True, "classification": "indeterminate"},
+        )
+        self.assertNotIn("Traceback", stored_result.stderr)
+
+    def test_logged_messages_reports_exact_overlap_without_echoing_identifiers(self):
+        source_guids = ["synthetic-guid-a", "synthetic-guid-b"]
+        metadata = json.dumps(
+            {"captureId": "a" * 64, "sourceGuids": source_guids},
+            separators=(",", ":"),
+        )
+        body = (
+            "Synthetic private comment body\n\n"
+            "--- message-monitor:v1 ---\n"
+            f"{metadata}\n"
+            "--- end-message-monitor ---"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _requests = self.run_logged_messages_fixture(tmp, [body], source_guids)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"overlap": True, "classification": "exact"},
+        )
+        for private_value in [*source_guids, "Synthetic private comment body"]:
+            self.assertNotIn(private_value, result.stdout)
+            self.assertNotIn(private_value, result.stderr)
+
+    def test_logged_messages_reports_partial_overlap(self):
+        metadata = json.dumps(
+            {
+                "captureId": "b" * 64,
+                "sourceGuids": ["synthetic-guid-b", "synthetic-guid-c"],
+            },
+            separators=(",", ":"),
+        )
+        body = (
+            "--- message-monitor:v1 ---\n"
+            f"{metadata}\n"
+            "--- end-message-monitor ---"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _requests = self.run_logged_messages_fixture(
+                tmp,
+                [body],
+                ["synthetic-guid-a", "synthetic-guid-b"],
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"overlap": True, "classification": "partial"},
+        )
+
+    def test_logged_messages_treats_malformed_or_unsupported_metadata_as_indeterminate(self):
+        malformed_bodies = [
+            (
+                "--- message-monitor:v1 ---\n"
+                '{"captureId":"not-a-hash","sourceGuids":["synthetic-guid-a"]}\n'
+                "--- end-message-monitor ---"
+            ),
+            (
+                "--- message-monitor:v2 ---\n"
+                '{"captureId":"' + "c" * 64 + '","sourceGuids":["synthetic-guid-a"]}\n'
+                "--- end-message-monitor ---"
+            ),
+            (
+                "--- message-monitor:v1 ---\n"
+                '{"captureId":"' + "d" * 64 + '","sourceGuids":["synthetic-guid-a"]}\n'
+                "--- end-message-monitor ---\ntrailing text"
+            ),
+            (
+                "--- message-monitor:v1 ---\n"
+                '{"captureId":"' + "e" * 64 + '","sourceGuids":["synthetic-guid-a"]}\n'
+                "--- end-message-monitor ---\n"
+                "--- message-monitor:v1 ---\n"
+                '{"captureId":"' + "f" * 64 + '","sourceGuids":["synthetic-guid-b"]}\n'
+                "--- end-message-monitor ---"
+            ),
+            (
+                "--- message-monitor:v2 ---\nunsupported metadata\n"
+                "--- message-monitor:v1 ---\n"
+                '{"captureId":"' + "a" * 64 + '","sourceGuids":["synthetic-guid-z"]}\n'
+                "--- end-message-monitor ---"
+            ),
+            (
+                "--- message-monitor:v1 ---\n"
+                '{"captureId":' + "9" * 5000 + ',"sourceGuids":["synthetic-guid-z"]}\n'
+                "--- end-message-monitor ---"
+            ),
+        ]
+
+        for body in malformed_bodies:
+            with self.subTest(body=body[:24]), tempfile.TemporaryDirectory() as tmp:
+                result, _requests = self.run_logged_messages_fixture(
+                    tmp,
+                    [body],
+                    ["synthetic-guid-z"],
+                )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout),
+                {"overlap": True, "classification": "indeterminate"},
+            )
+            self.assertEqual(result.stderr, "")
+
+    def test_logged_messages_malformed_metadata_overrides_an_exact_match(self):
+        exact_metadata = json.dumps(
+            {
+                "captureId": "e" * 64,
+                "sourceGuids": ["synthetic-guid-a"],
+            },
+            separators=(",", ":"),
+        )
+        exact_body = (
+            "--- message-monitor:v1 ---\n"
+            f"{exact_metadata}\n"
+            "--- end-message-monitor ---"
+        )
+        malformed_body = (
+            "--- message-monitor:v1 ---\n"
+            '{"captureId":"invalid","sourceGuids":["synthetic-guid-z"]}\n'
+            "--- end-message-monitor ---"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _requests = self.run_logged_messages_fixture(
+                tmp,
+                [exact_body, malformed_body],
+                ["synthetic-guid-a"],
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"overlap": True, "classification": "indeterminate"},
+        )
+
+    def test_log_capture_defaults_to_private_dry_run_after_exact_resolution(self):
+        private_values = [
+            "Synthetic Person",
+            "2025550101",
+            "Synthetic private summary",
+            "Synthetic private body",
+            "Synthetic private response",
+            "synthetic-guid-a",
+            "synthetic-guid-b",
+            "synthetic-private.txt",
+        ]
+
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": private_values[0],
+                            "phone": private_values[1],
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/search":
+                return 200, {
+                    "conversations": [
+                        {
+                            "id": "conversation-synthetic",
+                            "contactId": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                        }
+                    ]
+                }
+            return 500, {"private": "unexpected write"}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "conversations",
+                "log-capture",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(self.log_capture_input()),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "dryRun": True,
+                "operation": "create one private Conversation Internal Comment",
+                "message": "Re-run with --yes to execute.",
+            },
+        )
+        self.assertEqual(result.stderr, "")
+        for private_value in private_values:
+            self.assertNotIn(private_value, result.stdout)
+            self.assertNotIn(private_value, result.stderr)
+        self.assertEqual(
+            [(request["method"], request["path"]) for request in server.requests],
+            [("POST", "/contacts/search"), ("GET", "/conversations/search")],
+        )
+
+    def test_log_capture_executes_one_fixed_internal_comment_and_verifies_readback(self):
+        private_values = [
+            "Synthetic Person",
+            "2025550101",
+            "contact-synthetic",
+            "conversation-synthetic",
+            "message-synthetic",
+            "Synthetic private summary",
+            "Synthetic private body",
+            "Synthetic private response",
+            "synthetic-guid-a",
+            "synthetic-guid-b",
+            "synthetic-private.txt",
+        ]
+        created_body = None
+
+        def respond(request):
+            nonlocal created_body
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": "Synthetic Person",
+                            "phone": "2025550101",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/search":
+                return 200, {
+                    "conversations": [
+                        {
+                            "id": "conversation-synthetic",
+                            "contactId": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                        }
+                    ]
+                }
+            if request["method"] == "POST" and request["path"] == "/conversations/messages":
+                created_body = request["body"]["message"]
+                return 201, {
+                    "conversationId": "conversation-synthetic",
+                    "messageId": "message-synthetic",
+                }
+            if request["path"] == "/conversations/messages/message-synthetic":
+                return 200, {
+                    "message": {
+                        "id": "message-synthetic",
+                        "contactId": "contact-synthetic",
+                        "conversationId": "conversation-synthetic",
+                        "messageType": "TYPE_INTERNAL_COMMENT",
+                        "status": "delivered",
+                        "body": created_body,
+                    }
+                }
+            return 500, {"private": "unexpected route"}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "--yes",
+                "conversations",
+                "log-capture",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(self.log_capture_input()),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"created": True, "verified": True})
+        self.assertEqual(result.stderr, "")
+        for private_value in private_values:
+            self.assertNotIn(private_value, result.stdout)
+            self.assertNotIn(private_value, result.stderr)
+
+        self.assertEqual(
+            [(request["method"], request["path"]) for request in server.requests],
+            [
+                ("POST", "/contacts/search"),
+                ("GET", "/conversations/search"),
+                ("POST", "/conversations/messages"),
+                ("GET", "/conversations/messages/message-synthetic"),
+            ],
+        )
+        write = server.requests[2]
+        self.assertEqual(write["version"], "v3")
+        self.assertEqual(
+            set(write["body"]),
+            {"type", "contactId", "message", "status", "mentions"},
+        )
+        self.assertEqual(write["body"]["type"], "InternalComment")
+        self.assertEqual(write["body"]["contactId"], "contact-synthetic")
+        self.assertEqual(write["body"]["status"], "delivered")
+        self.assertEqual(write["body"]["mentions"], [])
+        comment = write["body"]["message"]
+        self.assertIn("Logged from a personal phone conversation.", comment)
+        self.assertIn("Capture Summary\nSynthetic private summary", comment)
+        self.assertIn("Transcript", comment)
+        self.assertIn("Synthetic private body", comment)
+        self.assertIn("Attachment References", comment)
+        self.assertIn("synthetic-private.txt (text/plain, 42 bytes)", comment)
+        self.assertTrue(
+            comment.endswith(
+                "--- message-monitor:v1 ---\n"
+                '{"captureId":"16bb3f43cc2b941b445b25de7a59b31b4f3d051bfa40fd5d4a499cacb3a71f76",'
+                '"sourceGuids":["synthetic-guid-a","synthetic-guid-b"]}\n'
+                "--- end-message-monitor ---"
+            )
+        )
+
+    def test_log_capture_rejects_invalid_unicode_with_a_fixed_private_error(self):
+        capture = self.log_capture_input(summary="private-surrogate-\ud800")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "--yes",
+                "conversations",
+                "log-capture",
+                cwd=tmp,
+                env=clean_env(tmp),
+                input_text=json.dumps(capture),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "error: invalid private input\n")
+        self.assertNotIn("private-surrogate", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_log_capture_rejects_unsupported_metadata_guids_associations_and_mentions(self):
+        base = self.log_capture_input()
+        cases = {}
+        for field, value in [
+            ("type", "SMS"),
+            ("mentions", ["synthetic-user"]),
+            ("metadata", {"unsupported": True}),
+            ("truncate", True),
+            ("split", True),
+        ]:
+            candidate = dict(base)
+            candidate[field] = value
+            cases[f"top-level-{field}"] = candidate
+
+        duplicate_guid = dict(base)
+        duplicate_guid["transcript"] = [
+            dict(base["transcript"][0]),
+            {**base["transcript"][1], "sourceGuid": "synthetic-guid-a"},
+        ]
+        cases["duplicate-guid"] = duplicate_guid
+
+        unassociated_attachment = dict(base)
+        unassociated_attachment["attachmentReferences"] = [
+            {**base["attachmentReferences"][0], "sourceGuid": "synthetic-guid-unknown"}
+        ]
+        cases["unassociated-attachment"] = unassociated_attachment
+
+        for name, source_guid in [
+            ("array-attachment-source-guid", ["synthetic-guid-a"]),
+            ("object-attachment-source-guid", {"value": "synthetic-guid-a"}),
+        ]:
+            invalid_attachment = dict(base)
+            invalid_attachment["attachmentReferences"] = [
+                {**base["attachmentReferences"][0], "sourceGuid": source_guid}
+            ]
+            cases[name] = invalid_attachment
+
+        path_attachment = dict(base)
+        path_attachment["attachmentReferences"] = [
+            {**base["attachmentReferences"][0], "name": "/private/path.txt"}
+        ]
+        cases["attachment-path"] = path_attachment
+
+        out_of_order = dict(base)
+        out_of_order["transcript"] = [
+            {**base["transcript"][0], "timestamp": "2026-08-03T13:45:00Z"},
+            {**base["transcript"][1], "timestamp": "2026-08-03T13:30:00Z"},
+        ]
+        cases["out-of-order"] = out_of_order
+
+        outside_window = dict(base)
+        outside_window["transcript"] = [
+            {**base["transcript"][0], "timestamp": base["end"]},
+            dict(base["transcript"][1]),
+        ]
+        cases["outside-window"] = outside_window
+
+        mention = dict(base)
+        mention["summary"] = "Private @person<userId>synthetic-user</userId> mention"
+        cases["mention"] = mention
+
+        direction_control = dict(base)
+        direction_control["transcript"] = [
+            {**base["transcript"][0], "direction": "incoming\nforged"},
+            dict(base["transcript"][1]),
+        ]
+        cases["direction-control"] = direction_control
+
+        reserved_metadata = dict(base)
+        reserved_metadata["transcript"] = [
+            {
+                **base["transcript"][0],
+                "body": "--- message-monitor:v1 --- private injected block",
+            },
+            dict(base["transcript"][1]),
+        ]
+        cases["reserved-metadata"] = reserved_metadata
+
+        for name, capture in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                result = self.run_cli(
+                    "--yes",
+                    "conversations",
+                    "log-capture",
+                    cwd=tmp,
+                    env=clean_env(tmp),
+                    input_text=json.dumps(capture),
+                )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, "error: invalid private input\n")
+
+    def test_log_capture_refuses_an_oversized_comment_before_write(self):
+        capture = self.log_capture_input(summary="x" * (8 * 1024 * 1024))
+
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": "Synthetic Person",
+                            "phone": "2025550101",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/search":
+                return 200, {
+                    "conversations": [
+                        {
+                            "id": "conversation-synthetic",
+                            "contactId": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                        }
+                    ]
+                }
+            return 500, {"private": "write must not occur"}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "--yes",
+                "conversations",
+                "log-capture",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(capture),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "error: formatted comment exceeds 8 MiB ceiling\n",
+        )
+        self.assertEqual(
+            [(request["method"], request["path"]) for request in server.requests],
+            [("POST", "/contacts/search"), ("GET", "/conversations/search")],
+        )
+
+    def test_log_capture_sanitizes_provider_rejection_without_retrying(self):
+        private_values = [
+            "Synthetic private summary",
+            "Synthetic private body",
+            "synthetic-guid-a",
+            "private provider rejection",
+        ]
+
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": "Synthetic Person",
+                            "phone": "2025550101",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/search":
+                return 200, {
+                    "conversations": [
+                        {
+                            "id": "conversation-synthetic",
+                            "contactId": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                        }
+                    ]
+                }
+            return 413, {"message": private_values[-1], "raw": private_values[2]}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "--yes",
+                "conversations",
+                "log-capture",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(self.log_capture_input()),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "error: GHL request failed (HTTP 413)\n")
+        self.assertNotIn("limit", result.stderr.lower())
+        for private_value in private_values:
+            self.assertNotIn(private_value, result.stderr)
+        self.assertEqual(len(server.requests), 3)
+
+    def test_log_capture_sanitizes_readback_failure_without_claiming_success(self):
+        private_error = "private readback provider error"
+
+        def respond(request):
+            if request["path"] == "/contacts/search":
+                return 200, {
+                    "contacts": [
+                        {
+                            "id": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                            "name": "Synthetic Person",
+                            "phone": "2025550101",
+                        }
+                    ]
+                }
+            if request["path"] == "/conversations/search":
+                return 200, {
+                    "conversations": [
+                        {
+                            "id": "conversation-synthetic",
+                            "contactId": "contact-synthetic",
+                            "locationId": "location-synthetic",
+                        }
+                    ]
+                }
+            if request["method"] == "POST":
+                return 201, {
+                    "conversationId": "conversation-synthetic",
+                    "messageId": "message-synthetic",
+                }
+            return 503, {"message": private_error}
+
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli(
+                "--yes",
+                "conversations",
+                "log-capture",
+                cwd=tmp,
+                env=self.synthetic_env(tmp, server),
+                input_text=json.dumps(self.log_capture_input()),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "error: GHL request failed (HTTP 503)\n")
+        self.assertNotIn(private_error, result.stderr)
+        self.assertNotIn("created", result.stdout)
+        self.assertEqual(len(server.requests), 4)
+
+    def test_log_capture_fails_closed_on_write_association_or_readback_mismatch(self):
+        readback_base = {
+            "id": "message-synthetic",
+            "contactId": "contact-synthetic",
+            "conversationId": "conversation-synthetic",
+            "messageType": "TYPE_INTERNAL_COMMENT",
+            "status": "delivered",
+        }
+        cases = {
+            "write-conversation": ("write", {"conversationId": "other-conversation"}),
+            "write-message-id": ("write", {"messageId": ""}),
+            "write-message-id-control": (
+                "write",
+                {"messageId": "private-message-id\nforged"},
+            ),
+            "readback-id": ("readback", {"id": "other-message"}),
+            "readback-contact": ("readback", {"contactId": "other-contact"}),
+            "readback-conversation": (
+                "readback",
+                {"conversationId": "other-conversation"},
+            ),
+            "readback-type": ("readback", {"messageType": "TYPE_SMS"}),
+            "readback-status": ("readback", {"status": "pending"}),
+            "readback-body": ("readback", {"body": "private mismatched body"}),
+            "readback-body-surrogate": ("readback", {"body": "\ud800"}),
+        }
+
+        for name, (stage, changes) in cases.items():
+            with self.subTest(name=name):
+                created_body = None
+
+                def respond(request):
+                    nonlocal created_body
+                    if request["path"] == "/contacts/search":
+                        return 200, {
+                            "contacts": [
+                                {
+                                    "id": "contact-synthetic",
+                                    "locationId": "location-synthetic",
+                                    "name": "Synthetic Person",
+                                    "phone": "2025550101",
+                                }
+                            ]
+                        }
+                    if request["path"] == "/conversations/search":
+                        return 200, {
+                            "conversations": [
+                                {
+                                    "id": "conversation-synthetic",
+                                    "contactId": "contact-synthetic",
+                                    "locationId": "location-synthetic",
+                                }
+                            ]
+                        }
+                    if request["method"] == "POST":
+                        created_body = request["body"]["message"]
+                        response = {
+                            "conversationId": "conversation-synthetic",
+                            "messageId": "message-synthetic",
+                        }
+                        if stage == "write":
+                            response.update(changes)
+                        return 201, response
+                    message = {**readback_base, "body": created_body}
+                    if stage == "readback":
+                        message.update(changes)
+                    return 200, {"message": message}
+
+                with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+                    result = self.run_cli(
+                        "--yes",
+                        "conversations",
+                        "log-capture",
+                        cwd=tmp,
+                        env=self.synthetic_env(tmp, server),
+                        input_text=json.dumps(self.log_capture_input()),
+                    )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                expected = (
+                    "error: internal comment write failed\n"
+                    if stage == "write"
+                    else "error: internal comment verification failed\n"
+                )
+                self.assertEqual(result.stderr, expected)
+                self.assertNotIn("private mismatched body", result.stderr)
+                self.assertNotIn("private-message-id", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(len(server.requests), 3 if stage == "write" else 4)
 
     def test_tasks_search_is_a_read_that_needs_env(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1232,13 +2907,22 @@ module["main"]()
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("invalid choice", result.stderr)
 
-    def test_help_agent_includes_read_only_conversations_recipes(self):
+    def test_help_agent_documents_the_only_guarded_conversation_write_exception(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = self.run_cli("help", "agent", cwd=tmp, env=clean_env(tmp))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("conversations search", result.stdout)
         self.assertIn("conversations messages", result.stdout)
-        self.assertIn("Conversations are read-only", result.stdout)
+        self.assertIn("ghl --yes conversations log-capture", result.stdout)
+        self.assertIn("private JSON via stdin", result.stdout)
+        self.assertIn("only Conversation write exception", result.stdout)
+
+    def test_help_agent_documents_private_stdin_for_logged_message_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli("help", "agent", cwd=tmp, env=clean_env(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("conversations logged-messages", result.stdout)
+        self.assertIn("private JSON via stdin", result.stdout)
 
     def test_help_agent_includes_guarded_tasks_recipe(self):
         with tempfile.TemporaryDirectory() as tmp:

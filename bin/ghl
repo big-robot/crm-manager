@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from datetime import datetime
+import hashlib
 import json
 import math
 import os
@@ -18,6 +19,7 @@ TASKS_VERSION = "v3"
 TASK_SEARCH_PAGE_SIZE = 20
 OPPORTUNITY_SEARCH_PAGE_SIZE = 100
 CONVERSATIONS_VERSION = "2021-04-15"
+CONVERSATION_MESSAGES_VERSION = "v3"
 CLI_VERSION = "0.3.0"
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 GENERIC_DEFAULT_PIPELINE = "Sales Pipeline"
@@ -34,11 +36,41 @@ GENERIC_CANONICAL_TAGS = ["client", "prospect", "partner", "do-not-contact", "ne
 CONFIG_FILENAMES = (".ghl-cli.json", "ghl-cli.json")
 _CONFIG = None
 _DOTENV = None
+PRIVATE_INPUT_MAX_BYTES = 1024 * 1024
+CAPTURE_PRIVATE_INPUT_MAX_BYTES = 32 * 1024 * 1024
+CAPTURE_COMMENT_MAX_BYTES = 8 * 1024 * 1024
+INTERNAL_COMMENT_PAGE_SIZE = 100
+INTERNAL_COMMENT_MAX_PAGES = 1000
+CAPTURE_METADATA_START = "--- message-monitor:v1 ---"
+CAPTURE_METADATA_END = "--- end-message-monitor ---"
+
+
+class CaptureMetadataError(ValueError):
+    pass
+
+
+class UntrustedJsonError(ValueError):
+    pass
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, _request, _file, _code, _message, _headers, _new_url):
+        return None
+
+
+HTTP_OPENER = urllib.request.build_opener(NoRedirectHandler)
 
 
 def fail(message, code=1):
     print(f"error: {message}", file=sys.stderr)
     raise SystemExit(code)
+
+
+def parse_untrusted_json(raw):
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError) as exc:
+        raise UntrustedJsonError from exc
 
 
 def candidate_roots():
@@ -123,6 +155,33 @@ def print_json(value):
     print(json.dumps(value, indent=2, sort_keys=False))
 
 
+def api_base_url():
+    override = os.environ.get("GHL_TEST_BASE_URL")
+    if not override:
+        return BASE_URL
+    try:
+        parsed = urllib.parse.urlsplit(override)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
+        fail("invalid test API endpoint")
+    if (
+        parsed.scheme != "http"
+        or hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        fail("invalid test API endpoint")
+    if not os.environ.get("GHL_LOCATION_ID") or not os.environ.get(
+        "GHL_PRIVATE_INTEGRATION_TOKEN"
+    ):
+        fail("test API endpoint requires explicit credentials")
+    return override.rstrip("/")
+
+
 def find_config_path():
     explicit = os.environ.get("GHL_CLI_CONFIG")
     if explicit:
@@ -175,13 +234,23 @@ def env_present(name):
     return bool(os.environ.get(name) or dotenv_values().get(name))
 
 
-def request(method, path, *, query=None, body=None, yes=False, mutates=None, version=None):
+def request(
+    method,
+    path,
+    *,
+    query=None,
+    body=None,
+    yes=False,
+    mutates=None,
+    version=None,
+    sanitize_errors=False,
+):
     method = method.upper()
     if mutates is None:
         mutates = method in WRITE_METHODS
     query = query or {}
     body = body or None
-    url = f"{BASE_URL}{path}"
+    url = f"{api_base_url()}{path}"
     if query:
         url = f"{url}?{urllib.parse.urlencode(query, doseq=True)}"
 
@@ -207,15 +276,29 @@ def request(method, path, *, query=None, body=None, yes=False, mutates=None, ver
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req) as resp:
-            raw = resp.read().decode("utf-8")
+        with HTTP_OPENER.open(req) as resp:
+            try:
+                raw = resp.read().decode("utf-8")
+            except UnicodeDecodeError:
+                if sanitize_errors:
+                    fail("GHL response was invalid")
+                raise
             if not raw:
                 return {}
-            return json.loads(raw)
+            try:
+                return parse_untrusted_json(raw)
+            except UntrustedJsonError:
+                if sanitize_errors:
+                    fail("GHL response was invalid")
+                raise
     except urllib.error.HTTPError as exc:
+        if sanitize_errors:
+            fail(f"GHL request failed (HTTP {exc.code})")
         raw = exc.read().decode("utf-8", errors="replace")
         fail(f"HTTP {exc.code}: {raw}")
     except urllib.error.URLError as exc:
+        if sanitize_errors:
+            fail("GHL request failed")
         fail(str(exc))
 
 
@@ -915,6 +998,547 @@ def search_conversations(args):
     print_json(data)
 
 
+def read_private_json_input(max_bytes):
+    raw = sys.stdin.buffer.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        fail("private input is too large")
+    try:
+        return parse_untrusted_json(raw)
+    except UntrustedJsonError:
+        fail("invalid private input")
+
+
+def read_logged_messages_input():
+    value = read_private_json_input(PRIVATE_INPUT_MAX_BYTES)
+    if not isinstance(value, dict) or set(value) != {"contactName", "phone", "sourceGuids"}:
+        fail("invalid private input")
+
+    contact_name = value.get("contactName")
+    phone = value.get("phone")
+    source_guids = value.get("sourceGuids")
+    if not isinstance(contact_name, str) or not contact_name.strip():
+        fail("invalid private input")
+    if not isinstance(phone, str) or not normalized_phone(phone):
+        fail("invalid private input")
+    if not valid_source_guids(source_guids):
+        fail("invalid private input")
+    return contact_name.strip(), normalized_phone(phone), source_guids
+
+
+def normalized_phone(value):
+    digits = re.sub(r"\D", "", value)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits if len(digits) >= 7 else None
+
+
+def valid_source_guid(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return (
+        0 < len(encoded) <= 512
+        and value == value.strip()
+        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+    )
+
+
+def valid_source_guids(values):
+    return (
+        isinstance(values, list)
+        and 0 < len(values) <= 500
+        and all(valid_source_guid(value) for value in values)
+        and len(set(values)) == len(values)
+    )
+
+
+def contact_names(contact):
+    names = {
+        value
+        for value in (contact.get("name"), contact.get("contactName"))
+        if isinstance(value, str)
+    }
+    combined = " ".join(
+        part.strip()
+        for part in (contact.get("firstName"), contact.get("lastName"))
+        if isinstance(part, str) and part.strip()
+    )
+    if combined:
+        names.add(combined)
+    return names
+
+
+def contact_phones(contact):
+    additional_phones = contact.get("additionalPhones")
+    if additional_phones is None:
+        additional_phones = []
+    if not isinstance(additional_phones, list):
+        return set()
+    values = [contact.get("phone")]
+    for entry in additional_phones:
+        if isinstance(entry, dict):
+            values.append(entry.get("phone"))
+    return {
+        normalized
+        for value in values
+        if isinstance(value, str) and (normalized := normalized_phone(value))
+    }
+
+
+def resolve_logged_messages_contact(contact_name, selected_phone):
+    expected_location = location_id()
+    contacts = []
+    seen_ids = set()
+    page = 1
+    while True:
+        data = request(
+            "POST",
+            "/contacts/search",
+            body={
+                "locationId": expected_location,
+                "page": page,
+                "pageLimit": 100,
+                "query": contact_name,
+            },
+            mutates=False,
+            sanitize_errors=True,
+        )
+        page_contacts = data.get("contacts") if isinstance(data, dict) else None
+        if not isinstance(page_contacts, list) or any(not isinstance(item, dict) for item in page_contacts):
+            fail("contact resolution failed")
+        page_ids = [item.get("id") for item in page_contacts]
+        if any(not valid_provider_id(item_id) for item_id in page_ids):
+            fail("contact resolution failed")
+        if seen_ids.intersection(page_ids) or len(set(page_ids)) != len(page_ids):
+            fail("contact resolution failed")
+        seen_ids.update(page_ids)
+        contacts.extend(page_contacts)
+        if len(page_contacts) < 100:
+            break
+        page += 1
+        if page > 1000:
+            fail("contact resolution failed")
+    matches = [
+        contact
+        for contact in contacts
+        if isinstance(contact, dict)
+        and contact.get("locationId") == expected_location
+        and contact_name in contact_names(contact)
+        and selected_phone in contact_phones(contact)
+    ]
+    if len(matches) != 1 or not isinstance(matches[0].get("id"), str):
+        fail("contact resolution failed")
+    return matches[0]
+
+
+def resolve_logged_messages_conversation(contact):
+    expected_location = location_id()
+    data = request(
+        "GET",
+        "/conversations/search",
+        query={
+            "locationId": expected_location,
+            "contactId": contact["id"],
+            "limit": 100,
+        },
+        version=CONVERSATIONS_VERSION,
+        sanitize_errors=True,
+    )
+    conversations = data.get("conversations") if isinstance(data, dict) else None
+    if not isinstance(conversations, list):
+        fail("conversation resolution failed")
+    total = data.get("total")
+    if total is not None and (not isinstance(total, int) or total != len(conversations)):
+        fail("conversation resolution failed")
+    if (
+        len(conversations) != 1
+        or not isinstance(conversations[0], dict)
+        or conversations[0].get("contactId") != contact["id"]
+        or conversations[0].get("locationId") != expected_location
+        or not valid_provider_id(conversations[0].get("id"))
+    ):
+        fail("conversation resolution failed")
+    return conversations[0]
+
+
+def read_internal_comments(contact, conversation):
+    expected_location = location_id()
+    comments = []
+    seen_cursors = set()
+    cursor = None
+    page_count = 0
+    while True:
+        if page_count >= INTERNAL_COMMENT_MAX_PAGES:
+            fail("internal comment history unavailable")
+        page_count += 1
+        query = {
+            "limit": INTERNAL_COMMENT_PAGE_SIZE,
+            "type": "TYPE_INTERNAL_COMMENTS",
+        }
+        if cursor is not None:
+            query["lastMessageId"] = cursor
+        data = request(
+            "GET",
+            f"/conversations/{conversation['id']}/messages",
+            query=query,
+            version=CONVERSATIONS_VERSION,
+            sanitize_errors=True,
+        )
+        envelope = data.get("messages") if isinstance(data, dict) else None
+        if not isinstance(envelope, dict):
+            fail("internal comment history unavailable")
+        page_messages = envelope.get("messages")
+        next_page = envelope.get("nextPage")
+        if (
+            not isinstance(page_messages, list)
+            or any(not isinstance(message, dict) for message in page_messages)
+            or len(page_messages) > INTERNAL_COMMENT_PAGE_SIZE
+            or not isinstance(next_page, bool)
+        ):
+            fail("internal comment history unavailable")
+        for message in page_messages:
+            if message.get("messageType") != "TYPE_INTERNAL_COMMENT":
+                continue
+            if (
+                message.get("contactId") != contact["id"]
+                or message.get("locationId") != expected_location
+                or message.get("conversationId") != conversation["id"]
+                or not isinstance(message.get("body"), str)
+            ):
+                fail("internal comment history unavailable")
+            comments.append(message)
+        if not next_page:
+            return comments
+        cursor = envelope.get("lastMessageId")
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            fail("internal comment history unavailable")
+        seen_cursors.add(cursor)
+
+
+def parse_capture_metadata(body):
+    if "--- message-monitor:" not in body and CAPTURE_METADATA_END not in body:
+        return None
+    if (
+        body.count("--- message-monitor:") != 1
+        or body.count(CAPTURE_METADATA_START) != 1
+        or body.count(CAPTURE_METADATA_END) != 1
+    ):
+        raise CaptureMetadataError
+    match = re.search(
+        rf"(?:\A|\n){re.escape(CAPTURE_METADATA_START)}\n([^\r\n]+)\n{re.escape(CAPTURE_METADATA_END)}\Z",
+        body,
+    )
+    if not match:
+        raise CaptureMetadataError
+    try:
+        metadata = parse_untrusted_json(match.group(1))
+    except UntrustedJsonError:
+        raise CaptureMetadataError
+    if not isinstance(metadata, dict) or set(metadata) != {"captureId", "sourceGuids"}:
+        raise CaptureMetadataError
+    capture_id = metadata.get("captureId")
+    source_guids = metadata.get("sourceGuids")
+    if (
+        not isinstance(capture_id, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", capture_id)
+        or not valid_source_guids(source_guids)
+    ):
+        raise CaptureMetadataError
+    return source_guids
+
+
+def classify_logged_message_overlap(comments, proposed_guids):
+    proposed = set(proposed_guids)
+    classification = "none"
+    for comment in comments:
+        try:
+            existing_guids = parse_capture_metadata(comment["body"])
+        except CaptureMetadataError:
+            return {"overlap": True, "classification": "indeterminate"}
+        if existing_guids is None:
+            continue
+        existing = set(existing_guids)
+        if existing == proposed:
+            classification = "exact"
+        elif existing.intersection(proposed) and classification == "none":
+            classification = "partial"
+    return {
+        "overlap": classification != "none",
+        "classification": classification,
+    }
+
+
+def logged_messages(args):
+    contact_name, selected_phone, source_guids = read_logged_messages_input()
+    contact = resolve_logged_messages_contact(contact_name, selected_phone)
+    conversation = resolve_logged_messages_conversation(contact)
+    comments = read_internal_comments(contact, conversation)
+    print_json(classify_logged_message_overlap(comments, source_guids))
+
+
+def parse_rfc3339(value):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
+        value,
+    ):
+        raise ValueError
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError
+    if parsed.utcoffset() is None:
+        raise ValueError
+    return parsed
+
+
+def valid_capture_text(value, *, allow_empty=False):
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return (
+        (allow_empty or bool(value.strip()))
+        and "\x00" not in value
+        and "--- message-monitor:" not in value
+        and CAPTURE_METADATA_END not in value
+        and "<userid>" not in value.lower()
+        and "</userid>" not in value.lower()
+    )
+
+
+def valid_capture_token(value):
+    return valid_capture_text(value) and not any(
+        ord(char) < 32 or ord(char) == 127 for char in value
+    )
+
+
+def valid_provider_id(value):
+    return isinstance(value, str) and bool(
+        re.fullmatch(r"[A-Za-z0-9_-]{1,256}", value)
+    )
+
+
+def sha256_utf8(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        return hashlib.sha256(value.encode("utf-8")).digest()
+    except UnicodeEncodeError:
+        return None
+
+
+def read_log_capture_input():
+    value = read_private_json_input(CAPTURE_PRIVATE_INPUT_MAX_BYTES)
+    expected_fields = {
+        "contactName",
+        "phone",
+        "start",
+        "end",
+        "summary",
+        "transcript",
+        "attachmentReferences",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        fail("invalid private input")
+
+    contact_name = value.get("contactName")
+    phone = value.get("phone")
+    start = value.get("start")
+    end = value.get("end")
+    summary = value.get("summary")
+    transcript = value.get("transcript")
+    attachment_references = value.get("attachmentReferences")
+    try:
+        start_time = parse_rfc3339(start)
+        end_time = parse_rfc3339(end)
+    except ValueError:
+        fail("invalid private input")
+    if (
+        not valid_capture_token(contact_name)
+        or not isinstance(phone, str)
+        or not normalized_phone(phone)
+        or end_time <= start_time
+        or not valid_capture_text(summary)
+        or not isinstance(transcript, list)
+        or not 0 < len(transcript) <= 500
+        or not isinstance(attachment_references, list)
+        or len(attachment_references) > 5000
+    ):
+        fail("invalid private input")
+
+    source_guids = []
+    previous_timestamp = None
+    transcript_fields = {"sourceGuid", "timestamp", "direction", "body"}
+    for message in transcript:
+        if not isinstance(message, dict) or set(message) != transcript_fields:
+            fail("invalid private input")
+        source_guid = message.get("sourceGuid")
+        timestamp = message.get("timestamp")
+        direction = message.get("direction")
+        body = message.get("body")
+        try:
+            message_time = parse_rfc3339(timestamp)
+        except ValueError:
+            fail("invalid private input")
+        if (
+            not valid_capture_text(source_guid)
+            or not valid_source_guid(source_guid)
+            or source_guid in source_guids
+            or not valid_capture_token(direction)
+            or len(direction.encode("utf-8")) > 64
+            or not valid_capture_text(body, allow_empty=True)
+            or message_time < start_time
+            or message_time >= end_time
+            or (previous_timestamp is not None and message_time < previous_timestamp)
+        ):
+            fail("invalid private input")
+        source_guids.append(source_guid)
+        previous_timestamp = message_time
+
+    source_guid_set = set(source_guids)
+    attachment_fields = {"sourceGuid", "name", "mimeType", "sizeBytes"}
+    for attachment in attachment_references:
+        if not isinstance(attachment, dict) or set(attachment) != attachment_fields:
+            fail("invalid private input")
+        source_guid = attachment.get("sourceGuid")
+        name = attachment.get("name")
+        mime_type = attachment.get("mimeType")
+        size_bytes = attachment.get("sizeBytes")
+        if (
+            not valid_source_guid(source_guid)
+            or source_guid not in source_guid_set
+            or not valid_capture_token(name)
+            or "/" in name
+            or "\\" in name
+            or not valid_capture_token(mime_type)
+            or not isinstance(size_bytes, int)
+            or isinstance(size_bytes, bool)
+            or size_bytes < 0
+        ):
+            fail("invalid private input")
+
+    value["contactName"] = contact_name.strip()
+    value["phone"] = normalized_phone(phone)
+    value["sourceGuids"] = source_guids
+    return value
+
+
+def format_capture_comment(capture, contact_id):
+    capture_identity = {
+        "version": 1,
+        "contactId": contact_id,
+        "start": capture["start"],
+        "end": capture["end"],
+        "sourceGuids": capture["sourceGuids"],
+    }
+    identity_json = json.dumps(
+        capture_identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    capture_id = hashlib.sha256(identity_json).hexdigest()
+    metadata = json.dumps(
+        {"captureId": capture_id, "sourceGuids": capture["sourceGuids"]},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    sections = [
+        "Logged from a personal phone conversation.",
+        f"Capture Window\nStart: {capture['start']}\nEnd: {capture['end']}",
+        f"Capture Summary\n{capture['summary']}",
+    ]
+    transcript_lines = ["Transcript"]
+    for index, message in enumerate(capture["transcript"], start=1):
+        transcript_lines.append(
+            f"Message {index} — {message['timestamp']} — {message['direction']}\n{message['body']}"
+        )
+    sections.append("\n\n".join(transcript_lines))
+
+    message_numbers = {
+        message["sourceGuid"]: index
+        for index, message in enumerate(capture["transcript"], start=1)
+    }
+    attachment_lines = ["Attachment References"]
+    if capture["attachmentReferences"]:
+        attachment_lines.extend(
+            (
+                f"- Message {message_numbers[item['sourceGuid']]}: {item['name']} "
+                f"({item['mimeType']}, {item['sizeBytes']} bytes)"
+            )
+            for item in capture["attachmentReferences"]
+        )
+    else:
+        attachment_lines.append("None")
+    sections.append("\n".join(attachment_lines))
+    sections.append(f"{CAPTURE_METADATA_START}\n{metadata}\n{CAPTURE_METADATA_END}")
+    body = "\n\n".join(sections)
+    if len(body.encode("utf-8")) > CAPTURE_COMMENT_MAX_BYTES:
+        fail("formatted comment exceeds 8 MiB ceiling")
+    return body
+
+
+def log_capture(args):
+    capture = read_log_capture_input()
+    contact = resolve_logged_messages_contact(capture["contactName"], capture["phone"])
+    conversation = resolve_logged_messages_conversation(contact)
+    body = format_capture_comment(capture, contact["id"])
+    if not args.yes:
+        print_json(
+            {
+                "dryRun": True,
+                "operation": "create one private Conversation Internal Comment",
+                "message": "Re-run with --yes to execute.",
+            }
+        )
+        return
+    created = request(
+        "POST",
+        "/conversations/messages",
+        body={
+            "type": "InternalComment",
+            "contactId": contact["id"],
+            "message": body,
+            "status": "delivered",
+            "mentions": [],
+        },
+        yes=True,
+        version=CONVERSATION_MESSAGES_VERSION,
+        sanitize_errors=True,
+    )
+    if (
+        not isinstance(created, dict)
+        or created.get("conversationId") != conversation["id"]
+        or not valid_provider_id(created.get("messageId"))
+    ):
+        fail("internal comment write failed")
+    message_id = created["messageId"]
+    readback = request(
+        "GET",
+        f"/conversations/messages/{message_id}",
+        version=CONVERSATION_MESSAGES_VERSION,
+        sanitize_errors=True,
+    )
+    message = readback.get("message") if isinstance(readback, dict) else None
+    expected_hash = sha256_utf8(body)
+    if (
+        not isinstance(message, dict)
+        or message.get("id") != message_id
+        or message.get("contactId") != contact["id"]
+        or message.get("conversationId") != conversation["id"]
+        or message.get("messageType") != "TYPE_INTERNAL_COMMENT"
+        or message.get("status") != "delivered"
+        or sha256_utf8(message.get("body")) != expected_hash
+    ):
+        fail("internal comment verification failed")
+    print_json({"created": True, "verified": True})
+
+
 def conversation_messages(args):
     data = request(
         "GET",
@@ -1064,12 +1688,15 @@ Tasks:
 Users (read-only):
 - List: ghl users list
 
-Conversations (read-only):
+Conversations (reads plus one fixed private write):
 - Search by contact: ghl conversations search --contact-id CONTACT_ID
 - Search by text: ghl conversations search --query "{contact_query}" --limit 20
 - Thread messages: ghl conversations messages CONVERSATION_ID --limit 50
 - Full email body: ghl conversations email EMAIL_MESSAGE_ID
-- Conversations are read-only in this CLI: no send, reply, update, or delete exists, by policy.
+- Logged-message overlap: ghl conversations logged-messages (private JSON via stdin; never command arguments)
+- Dry-run Internal Comment: ghl conversations log-capture (private JSON via stdin; never command arguments)
+- Execute after Log Approval: ghl --yes conversations log-capture (private JSON via stdin)
+- This fixed private Internal Comment is the only Conversation write exception; no generic send, reply, update, or delete exists.
 
 Recurring value rule:
 - Monthly recurring opportunity value = expected first-year revenue.
@@ -1345,7 +1972,10 @@ def build_parser():
     users_sub = users.add_subparsers(dest="users_command", required=True)
     users_sub.add_parser("list").set_defaults(func=list_users)
 
-    convos = sub.add_parser("conversations", help="read-only access to captured conversations")
+    convos = sub.add_parser(
+        "conversations",
+        help="read access plus one guarded private Internal Comment write",
+    )
     convos_sub = convos.add_subparsers(dest="conversations_command", required=True)
     convo_search = convos_sub.add_parser("search")
     convo_search.add_argument("--contact-id")
@@ -1359,6 +1989,14 @@ def build_parser():
     convo_email = convos_sub.add_parser("email")
     convo_email.add_argument("id")
     convo_email.set_defaults(func=conversation_email)
+    convos_sub.add_parser(
+        "logged-messages",
+        help="check private source identifiers from stdin against logged captures",
+    ).set_defaults(func=logged_messages)
+    convos_sub.add_parser(
+        "log-capture",
+        help="create one guarded private Internal Comment from strict JSON on stdin",
+    ).set_defaults(func=log_capture)
 
     cleanup = sub.add_parser("cleanup")
     cleanup_sub = cleanup.add_subparsers(dest="cleanup_command", required=True)
