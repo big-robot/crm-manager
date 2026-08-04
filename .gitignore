@@ -1,5 +1,7 @@
 tmp/
-docs/
+docs/*
+!docs/agents/
+!docs/agents/*.md
 backups/
 node_modules/
 __pycache__/
