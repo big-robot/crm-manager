@@ -1,13 +1,17 @@
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
 import runpy
 import subprocess
+import sys
 import tempfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from urllib.parse import parse_qs, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +39,74 @@ class GhlCliTests(unittest.TestCase):
             check=False,
         )
 
+    def run_cli_with_provider(self, responder, *args):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                query = {
+                    key: values[0] if len(values) == 1 else values
+                    for key, values in parse_qs(
+                        parsed.query, keep_blank_values=True
+                    ).items()
+                }
+                requests.append((parsed.path, query))
+                response = responder(parsed.path, query)
+                if isinstance(response, tuple):
+                    status, payload = response
+                else:
+                    status, payload = 200, response
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                env = clean_env(tmp)
+                env["GHL_LOCATION_ID"] = "synthetic-location"
+                env["GHL_PRIVATE_INTEGRATION_TOKEN"] = "synthetic-token"
+                runner = """
+import runpy
+import sys
+
+cli_path = sys.argv.pop(1)
+base_url = sys.argv.pop(1)
+module = runpy.run_path(cli_path)
+module["request"].__globals__["BASE_URL"] = base_url
+module["main"]()
+"""
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        runner,
+                        str(CLI),
+                        f"http://127.0.0.1:{server.server_port}",
+                        *args,
+                    ],
+                    cwd=tmp,
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        return result, requests
+
     def test_version_and_help(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = clean_env(tmp)
@@ -51,6 +123,10 @@ class GhlCliTests(unittest.TestCase):
             result = self.run_cli("help", "agent", cwd=tmp, env=clean_env(tmp))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('opportunities search --pipeline "Sales Pipeline"', result.stdout)
+        self.assertIn(
+            'opportunities search --pipeline "Sales Pipeline" --status open --all',
+            result.stdout,
+        )
         self.assertIn("Deletes require global --yes and --confirm-delete ID", result.stdout)
 
     def test_init_creates_config_only(self):
@@ -295,6 +371,459 @@ class GhlCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing GHL_LOCATION_ID", result.stderr)
         self.assertNotIn("dryRun", result.stdout)
+
+    def test_opportunity_search_all_stops_after_one_short_page(self):
+        page = {
+            "opportunities": [{"id": "opp-1"}, {"id": "opp-2"}],
+            "meta": {"total": 2},
+            "aggregations": {"status": {"open": 2}},
+        }
+
+        result, requests = self.run_cli_with_provider(
+            lambda _path, _query: page,
+            "opportunities",
+            "search",
+            "--all",
+            "--query",
+            "Example Co",
+            "--status",
+            "open",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), page)
+        self.assertEqual(
+            requests,
+            [
+                (
+                    "/opportunities/search",
+                    {
+                        "location_id": "synthetic-location",
+                        "limit": "100",
+                        "status": "open",
+                        "q": "Example Co",
+                    },
+                )
+            ],
+        )
+
+    def test_opportunity_search_all_combines_pages_and_reapplies_filters(self):
+        opportunity_calls = 0
+
+        def responder(path, query):
+            nonlocal opportunity_calls
+            if path == "/opportunities/pipelines":
+                return {
+                    "pipelines": [
+                        {"id": "pipeline-123", "name": "Sales Pipeline"}
+                    ]
+                }
+            opportunity_calls += 1
+            if opportunity_calls == 1:
+                return {
+                    "opportunities": [
+                        {"id": f"opp-{index}"} for index in range(100)
+                    ],
+                    "meta": {
+                        "total": 102,
+                        "currentPage": 1,
+                        "nextPage": 2,
+                        "startAfter": 1720000000000,
+                        "startAfterId": "opp-99",
+                    },
+                    "aggregations": {"status": {"open": 102}},
+                }
+            return {
+                "opportunities": [{"id": "opp-100"}, {"id": "opp-101"}],
+                "meta": {"total": 102, "currentPage": 2},
+            }
+
+        result, requests = self.run_cli_with_provider(
+            responder,
+            "opportunities",
+            "search",
+            "--all",
+            "--query",
+            "Example Co",
+            "--pipeline",
+            "Sales Pipeline",
+            "--status",
+            "open",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(len(payload["opportunities"]), 102)
+        self.assertEqual(payload["opportunities"][-1]["id"], "opp-101")
+        self.assertEqual(payload["meta"], {"total": 102, "currentPage": 2})
+        self.assertEqual(payload["aggregations"], {"status": {"open": 102}})
+        page_queries = [query for path, query in requests if path == "/opportunities/search"]
+        self.assertEqual(len(page_queries), 2)
+        expected_filters = {
+            "location_id": "synthetic-location",
+            "limit": "100",
+            "status": "open",
+            "q": "Example Co",
+            "pipeline_id": "pipeline-123",
+        }
+        self.assertEqual(page_queries[0], expected_filters)
+        self.assertEqual(
+            page_queries[1],
+            {
+                **expected_filters,
+                "startAfter": "1720000000000",
+                "startAfterId": "opp-99",
+            },
+        )
+
+    def test_opportunity_search_all_fetches_after_exactly_full_page(self):
+        pages = [
+            {
+                "opportunities": [
+                    {"id": f"opp-{index}"} for index in range(100)
+                ],
+                "meta": {
+                    "total": 100,
+                    "startAfter": 1720000000000,
+                    "startAfterId": "opp-99",
+                },
+            },
+            {"opportunities": [], "meta": {"total": 100}},
+        ]
+
+        result, requests = self.run_cli_with_provider(
+            lambda _path, _query: pages.pop(0),
+            "opportunities",
+            "search",
+            "--all",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)["opportunities"]), 100)
+        self.assertEqual(len(requests), 2)
+
+    def test_opportunity_search_all_continues_after_short_nonterminal_page(self):
+        pages = [
+            {
+                "opportunities": [{"id": "opp-1"}, {"id": "opp-2"}],
+                "meta": {
+                    "total": 3,
+                    "currentPage": 1,
+                    "nextPage": 2,
+                    "startAfter": 1720000000000,
+                    "startAfterId": "opp-2",
+                },
+            },
+            {
+                "opportunities": [{"id": "opp-3"}],
+                "meta": {"total": 3, "currentPage": 2},
+            },
+        ]
+
+        result, requests = self.run_cli_with_provider(
+            lambda _path, _query: pages.pop(0),
+            "opportunities",
+            "search",
+            "--all",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            [opportunity["id"] for opportunity in payload["opportunities"]],
+            ["opp-1", "opp-2", "opp-3"],
+        )
+        self.assertEqual(payload["meta"], {"total": 3, "currentPage": 2})
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[1][1]["startAfter"], "1720000000000")
+        self.assertEqual(requests[1][1]["startAfterId"], "opp-2")
+
+    def test_opportunity_search_all_continues_for_next_page_url_on_fixed_endpoint(self):
+        pages = [
+            {
+                "opportunities": [{"id": "opp-1"}, {"id": "opp-2"}],
+                "meta": {
+                    "total": 3,
+                    "currentPage": 1,
+                    "nextPageUrl": "https://untrusted.invalid/do-not-follow",
+                    "startAfter": 1720000000000,
+                    "startAfterId": "opp-2",
+                },
+                "aggregations": {"status": {"open": 3}},
+            },
+            {
+                "opportunities": [{"id": "opp-3"}],
+                "meta": {"total": 3, "currentPage": 2},
+            },
+        ]
+
+        result, requests = self.run_cli_with_provider(
+            lambda _path, _query: pages.pop(0),
+            "opportunities",
+            "search",
+            "--all",
+            "--query",
+            "Example Co",
+            "--status",
+            "open",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            [opportunity["id"] for opportunity in payload["opportunities"]],
+            ["opp-1", "opp-2", "opp-3"],
+        )
+        self.assertEqual(payload["meta"], {"total": 3, "currentPage": 2})
+        self.assertEqual(payload["aggregations"], {"status": {"open": 3}})
+        self.assertEqual(
+            requests,
+            [
+                (
+                    "/opportunities/search",
+                    {
+                        "location_id": "synthetic-location",
+                        "limit": "100",
+                        "status": "open",
+                        "q": "Example Co",
+                    },
+                ),
+                (
+                    "/opportunities/search",
+                    {
+                        "location_id": "synthetic-location",
+                        "limit": "100",
+                        "status": "open",
+                        "q": "Example Co",
+                        "startAfter": "1720000000000",
+                        "startAfterId": "opp-2",
+                    },
+                ),
+            ],
+        )
+
+    def test_opportunity_search_all_rejects_malformed_next_page_url(self):
+        for next_page_url in ("", "   ", 2):
+            with self.subTest(next_page_url=next_page_url):
+                page = {
+                    "opportunities": [],
+                    "meta": {"total": 0, "nextPageUrl": next_page_url},
+                }
+                result, requests = self.run_cli_with_provider(
+                    lambda _path, _query, page=page: page,
+                    "opportunities",
+                    "search",
+                    "--all",
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("malformed nextPageUrl value", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(len(requests), 1)
+
+    def test_opportunity_search_all_rejects_terminal_total_mismatch(self):
+        page = {
+            "opportunities": [{"id": "opp-1"}, {"id": "opp-2"}],
+            "meta": {"total": 3, "currentPage": 1},
+        }
+
+        result, requests = self.run_cli_with_provider(
+            lambda _path, _query: page,
+            "opportunities",
+            "search",
+            "--all",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match pagination total 3", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(requests), 1)
+
+    def test_opportunity_search_all_rejects_malformed_total(self):
+        page = {
+            "opportunities": [],
+            "meta": {"total": "not-a-count"},
+        }
+
+        result, requests = self.run_cli_with_provider(
+            lambda _path, _query: page,
+            "opportunities",
+            "search",
+            "--all",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed pagination total", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(requests), 1)
+
+    def test_opportunity_search_all_rejects_changed_total(self):
+        pages = [
+            {
+                "opportunities": [
+                    {"id": f"opp-{index}"} for index in range(100)
+                ],
+                "meta": {
+                    "total": 101,
+                    "nextPage": 2,
+                    "startAfter": 1720000000000,
+                    "startAfterId": "opp-99",
+                },
+            },
+            {
+                "opportunities": [{"id": "opp-100"}],
+                "meta": {"total": 102},
+            },
+        ]
+
+        result, requests = self.run_cli_with_provider(
+            lambda _path, _query: pages.pop(0),
+            "opportunities",
+            "search",
+            "--all",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("changed pagination total from 101 to 102", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(requests), 2)
+
+    def test_opportunity_search_all_rejects_missing_or_malformed_cursor(self):
+        invalid_meta = [
+            ({"startAfterId": "opp-99"}, "missing pagination cursor"),
+            (
+                {"startAfter": "not-a-timestamp", "startAfterId": "opp-99"},
+                "malformed pagination cursor",
+            ),
+            (
+                {"startAfter": 1720000000000, "startAfterId": ""},
+                "malformed pagination cursor",
+            ),
+        ]
+
+        for meta, expected_error in invalid_meta:
+            with self.subTest(meta=meta):
+                page = {
+                    "opportunities": [
+                        {"id": f"opp-{index}"} for index in range(100)
+                    ],
+                    "meta": meta,
+                }
+                result, requests = self.run_cli_with_provider(
+                    lambda _path, _query, page=page: page,
+                    "opportunities",
+                    "search",
+                    "--all",
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(len(requests), 1)
+
+    def test_opportunity_search_all_rejects_repeated_cursor(self):
+        page_number = 0
+        cursor = {
+            "startAfter": 1720000000000,
+            "startAfterId": "opp-boundary",
+        }
+
+        def responder(_path, _query):
+            nonlocal page_number
+            page_number += 1
+            return {
+                "opportunities": [
+                    {"id": f"opp-{page_number}-{index}"} for index in range(100)
+                ],
+                "meta": cursor,
+            }
+
+        result, requests = self.run_cli_with_provider(
+            responder,
+            "opportunities",
+            "search",
+            "--all",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("repeated its pagination cursor", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(requests), 2)
+
+    def test_opportunity_search_all_later_page_failure_emits_no_partial_result(self):
+        request_number = 0
+
+        def responder(_path, _query):
+            nonlocal request_number
+            request_number += 1
+            if request_number == 2:
+                return 503, {"message": "synthetic later-page failure"}
+            return {
+                "opportunities": [
+                    {"id": f"opp-{index}"} for index in range(100)
+                ],
+                "meta": {
+                    "startAfter": 1720000000000,
+                    "startAfterId": "opp-99",
+                },
+            }
+
+        result, requests = self.run_cli_with_provider(
+            responder,
+            "opportunities",
+            "search",
+            "--all",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HTTP 503", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(requests), 2)
+
+    def test_opportunity_search_limit_remains_a_single_bounded_request(self):
+        page = {
+            "opportunities": [{"id": f"opp-{index}"} for index in range(7)],
+            "meta": {"total": 20},
+        }
+
+        result, requests = self.run_cli_with_provider(
+            lambda _path, _query: page,
+            "opportunities",
+            "search",
+            "--limit",
+            "7",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), page)
+        self.assertEqual(
+            requests,
+            [
+                (
+                    "/opportunities/search",
+                    {
+                        "location_id": "synthetic-location",
+                        "limit": "7",
+                        "status": "all",
+                    },
+                )
+            ],
+        )
+
+    def test_opportunity_search_rejects_all_with_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "opportunities",
+                "search",
+                "--all",
+                "--limit",
+                "10",
+                cwd=tmp,
+                env=clean_env(tmp),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not allowed with argument", result.stderr)
 
     def test_task_search_reports_unlinked_records_without_hiding_them(self):
         module = runpy.run_path(str(CLI))

@@ -42,6 +42,7 @@ ghl contacts search --query "Example Co" --limit 20
 ghl tasks search --limit 100
 ghl users list
 ghl opportunities search --pipeline "Sales Pipeline" --status all --limit 100
+ghl opportunities search --pipeline "Sales Pipeline" --status open --all
 ghl conversations search --contact-id CONTACT_ID
 ```
 
@@ -91,7 +92,12 @@ Search first:
 
 ```sh
 ghl opportunities search --pipeline "Sales Pipeline" --status all --limit 100
+ghl opportunities search --pipeline "Sales Pipeline" --status open --all
 ```
+
+Use `--limit` for one bounded provider response. Use `--all` only when the
+complete matching result set is required; it fails without printing partial
+results if provider pagination cannot be completed safely.
 
 Create monthly recurring:
 
