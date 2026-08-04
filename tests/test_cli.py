@@ -2363,6 +2363,74 @@ class GhlCliTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(len(requests), 2)
 
+    def test_opportunity_search_all_rejects_duplicate_ids_across_pages(self):
+        pages = [
+            {
+                "opportunities": [{"id": "opp-1"}, {"id": "opp-2"}],
+                "meta": {
+                    "total": 3,
+                    "nextPage": 2,
+                    "startAfter": 1720000000000,
+                    "startAfterId": "opp-2",
+                },
+            },
+            {
+                "opportunities": [{"id": "opp-2"}],
+                "meta": {"total": 3},
+            },
+        ]
+
+        result, requests = self.run_cli_with_provider(
+            lambda _path, _query: pages.pop(0),
+            "opportunities",
+            "search",
+            "--all",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("repeated opportunity id 'opp-2'", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(requests), 2)
+
+    def test_opportunity_search_all_rejects_continuing_empty_page(self):
+        pages = [
+            {
+                "opportunities": [{"id": "opp-1"}],
+                "meta": {
+                    "total": 2,
+                    "nextPage": 2,
+                    "startAfter": 1720000000000,
+                    "startAfterId": "opp-1",
+                },
+            },
+            {
+                "opportunities": [],
+                "meta": {
+                    "total": 2,
+                    "nextPage": 3,
+                    "startAfter": 1720000000001,
+                    "startAfterId": "opp-empty-page",
+                },
+            },
+        ]
+
+        def responder(_path, _query):
+            if not pages:
+                return 500, {"message": "unexpected third request"}
+            return pages.pop(0)
+
+        result, requests = self.run_cli_with_provider(
+            responder,
+            "opportunities",
+            "search",
+            "--all",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("made no record progress", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(requests), 2)
+
     def test_opportunity_search_all_rejects_missing_or_malformed_cursor(self):
         invalid_meta = [
             ({"startAfterId": "opp-99"}, "missing pagination cursor"),

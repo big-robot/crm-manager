@@ -638,6 +638,7 @@ def validate_opportunity_search_cursor(meta, page_number):
 def paginate_opportunity_search(fetch_page):
     result = None
     collected = []
+    seen_opportunity_ids = set()
     cursor = None
     seen_cursors = set()
     page_number = 0
@@ -663,6 +664,28 @@ def paginate_opportunity_search(fetch_page):
         expected_total, meta_continues = validate_opportunity_search_meta(
             meta, page_number, expected_total
         )
+
+        page_opportunity_ids = []
+        for index, opportunity in enumerate(opportunities):
+            if not isinstance(opportunity, dict):
+                raise OpportunityPaginationError(
+                    f"opportunity search page {page_number} returned a malformed "
+                    f"opportunity at index {index}"
+                )
+            opportunity_id = opportunity.get("id")
+            if not isinstance(opportunity_id, str) or not opportunity_id.strip():
+                raise OpportunityPaginationError(
+                    f"opportunity search page {page_number} returned a malformed "
+                    f"opportunity id at index {index}"
+                )
+            if opportunity_id in seen_opportunity_ids:
+                raise OpportunityPaginationError(
+                    f"opportunity search page {page_number} repeated opportunity id "
+                    f"{opportunity_id!r}"
+                )
+            page_opportunity_ids.append(opportunity_id)
+
+        seen_opportunity_ids.update(page_opportunity_ids)
         collected.extend(opportunities)
         if expected_total is not None and len(collected) > expected_total:
             raise OpportunityPaginationError(
@@ -674,6 +697,10 @@ def paginate_opportunity_search(fetch_page):
             meta_continues
             or len(opportunities) >= OPPORTUNITY_SEARCH_PAGE_SIZE
         )
+        if should_continue and not opportunities:
+            raise OpportunityPaginationError(
+                f"opportunity search page {page_number} made no record progress"
+            )
         if not should_continue:
             if expected_total is not None and len(collected) != expected_total:
                 raise OpportunityPaginationError(
