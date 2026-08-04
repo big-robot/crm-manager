@@ -19,5 +19,8 @@ issues containing tokens, credentials, customer data, or exploit details.
 ## CLI Scope
 
 This CLI is intended for CRM hygiene: contacts, opportunities, pipelines, tags,
-and custom fields. Do not add outbound messaging, payment, social posting, or
-automation execution without a separate security review.
+custom fields, and one separately reviewed private Conversation Internal Comment
+operation. `conversations log-capture` is the only Conversation write exception;
+it is fixed to an internal comment, dry-run-first, and readback-verified. Do not
+add customer-facing or generic messaging, payment, social posting, or automation
+execution without a separate security review.
