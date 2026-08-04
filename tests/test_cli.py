@@ -966,6 +966,24 @@ class GhlCliTests(unittest.TestCase):
             self.assertNotIn(private_value, result.stdout)
             self.assertNotIn(private_value, result.stderr)
 
+    def test_private_commands_reject_invalid_utf8_without_traceback(self):
+        for command in ["logged-messages", "log-capture"]:
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as tmp:
+                result = subprocess.run(
+                    [str(CLI), "conversations", command],
+                    cwd=tmp,
+                    env=clean_env(tmp),
+                    input=b'{"private":"\xff"}',
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b"")
+            self.assertEqual(result.stderr, b"error: invalid private input\n")
+            self.assertNotIn(b"Traceback", result.stderr)
+
     def test_logged_messages_rejects_surrogate_source_guids_without_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
             proposed_result = self.run_cli(

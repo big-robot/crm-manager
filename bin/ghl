@@ -812,14 +812,18 @@ def search_conversations(args):
     print_json(data)
 
 
-def read_logged_messages_input():
-    raw = sys.stdin.read(PRIVATE_INPUT_MAX_BYTES + 1)
-    if len(raw.encode("utf-8")) > PRIVATE_INPUT_MAX_BYTES:
+def read_private_json_input(max_bytes):
+    raw = sys.stdin.buffer.read(max_bytes + 1)
+    if len(raw) > max_bytes:
         fail("private input is too large")
     try:
-        value = json.loads(raw)
-    except json.JSONDecodeError:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         fail("invalid private input")
+
+
+def read_logged_messages_input():
+    value = read_private_json_input(PRIVATE_INPUT_MAX_BYTES)
     if not isinstance(value, dict) or set(value) != {"contactName", "phone", "sourceGuids"}:
         fail("invalid private input")
 
@@ -1118,13 +1122,7 @@ def valid_provider_id(value):
 
 
 def read_log_capture_input():
-    raw = sys.stdin.read(CAPTURE_PRIVATE_INPUT_MAX_BYTES + 1)
-    if len(raw.encode("utf-8")) > CAPTURE_PRIVATE_INPUT_MAX_BYTES:
-        fail("private input is too large")
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError:
-        fail("invalid private input")
+    value = read_private_json_input(CAPTURE_PRIVATE_INPUT_MAX_BYTES)
     expected_fields = {
         "contactName",
         "phone",
