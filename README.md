@@ -162,8 +162,15 @@ ghl opportunities search --pipeline "Sales Pipeline" --status all
 ghl tasks search --limit 100
 ghl conversations search --contact-id CONTACT_ID
 ghl conversations messages CONVERSATION_ID
+ghl conversations logged-messages # reads contactName, phone, and sourceGuids as private JSON on stdin
 ghl cleanup audit
 ```
+
+`conversations logged-messages` is read-only. It resolves exactly one Contact
+and associated existing Conversation, reads all Internal Comments, and reports
+`none`, `exact`, `partial`, or fail-closed `indeterminate` overlap. Pass its
+private JSON through stdin; never place phone numbers or source GUIDs in command
+arguments, URLs, or logs.
 
 Write commands are dry-run by default. Add `--yes` before the command to execute:
 

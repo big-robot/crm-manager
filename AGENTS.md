@@ -150,7 +150,12 @@ ghl conversations search --contact-id CONTACT_ID
 ghl conversations search --query "Example Co" --limit 20
 ghl conversations messages CONVERSATION_ID --limit 50
 ghl conversations email EMAIL_MESSAGE_ID
+ghl conversations logged-messages # reads contactName, phone, and sourceGuids as private JSON on stdin
 ```
+
+`logged-messages` resolves exactly one matching Contact and existing Conversation,
+then reports `none`, `exact`, `partial`, or fail-closed `indeterminate` overlap.
+Never put its private stdin fields in command arguments, URLs, or logs.
 
 ## Tests
 
