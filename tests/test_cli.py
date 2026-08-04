@@ -2392,6 +2392,24 @@ class GhlCliTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(len(requests), 2)
 
+    def test_opportunity_search_all_rejects_duplicate_ids_within_page(self):
+        page = {
+            "opportunities": [{"id": "opp-1"}, {"id": "opp-1"}],
+            "meta": {"total": 2},
+        }
+
+        result, requests = self.run_cli_with_provider(
+            lambda _path, _query: page,
+            "opportunities",
+            "search",
+            "--all",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("repeated opportunity id 'opp-1'", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(requests), 1)
+
     def test_opportunity_search_all_rejects_continuing_empty_page(self):
         pages = [
             {

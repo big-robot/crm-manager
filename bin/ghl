@@ -665,7 +665,7 @@ def paginate_opportunity_search(fetch_page):
             meta, page_number, expected_total
         )
 
-        page_opportunity_ids = []
+        page_opportunity_ids = set()
         for index, opportunity in enumerate(opportunities):
             if not isinstance(opportunity, dict):
                 raise OpportunityPaginationError(
@@ -678,12 +678,15 @@ def paginate_opportunity_search(fetch_page):
                     f"opportunity search page {page_number} returned a malformed "
                     f"opportunity id at index {index}"
                 )
-            if opportunity_id in seen_opportunity_ids:
+            if (
+                opportunity_id in seen_opportunity_ids
+                or opportunity_id in page_opportunity_ids
+            ):
                 raise OpportunityPaginationError(
                     f"opportunity search page {page_number} repeated opportunity id "
                     f"{opportunity_id!r}"
                 )
-            page_opportunity_ids.append(opportunity_id)
+            page_opportunity_ids.add(opportunity_id)
 
         seen_opportunity_ids.update(page_opportunity_ids)
         collected.extend(opportunities)
