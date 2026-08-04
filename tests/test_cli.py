@@ -966,6 +966,50 @@ class GhlCliTests(unittest.TestCase):
             self.assertNotIn(private_value, result.stdout)
             self.assertNotIn(private_value, result.stderr)
 
+    def test_logged_messages_rejects_surrogate_source_guids_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proposed_result = self.run_cli(
+                "conversations",
+                "logged-messages",
+                cwd=tmp,
+                env=clean_env(tmp),
+                input_text=json.dumps(
+                    {
+                        "contactName": "Synthetic Person",
+                        "phone": "2025550101",
+                        "sourceGuids": ["\ud800"],
+                    }
+                ),
+            )
+
+        self.assertNotEqual(proposed_result.returncode, 0)
+        self.assertEqual(proposed_result.stdout, "")
+        self.assertEqual(proposed_result.stderr, "error: invalid private input\n")
+        self.assertNotIn("Traceback", proposed_result.stderr)
+
+        metadata = json.dumps(
+            {"captureId": "a" * 64, "sourceGuids": ["\ud800"]},
+            separators=(",", ":"),
+        )
+        body = (
+            "--- message-monitor:v1 ---\n"
+            f"{metadata}\n"
+            "--- end-message-monitor ---"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            stored_result, _requests = self.run_logged_messages_fixture(
+                tmp,
+                [body],
+                ["synthetic-guid-a"],
+            )
+
+        self.assertEqual(stored_result.returncode, 0, stored_result.stderr)
+        self.assertEqual(
+            json.loads(stored_result.stdout),
+            {"overlap": True, "classification": "indeterminate"},
+        )
+        self.assertNotIn("Traceback", stored_result.stderr)
+
     def test_logged_messages_reports_exact_overlap_without_echoing_identifiers(self):
         source_guids = ["synthetic-guid-a", "synthetic-guid-b"]
         metadata = json.dumps(
@@ -1316,6 +1360,16 @@ class GhlCliTests(unittest.TestCase):
             {**base["attachmentReferences"][0], "sourceGuid": "synthetic-guid-unknown"}
         ]
         cases["unassociated-attachment"] = unassociated_attachment
+
+        for name, source_guid in [
+            ("array-attachment-source-guid", ["synthetic-guid-a"]),
+            ("object-attachment-source-guid", {"value": "synthetic-guid-a"}),
+        ]:
+            invalid_attachment = dict(base)
+            invalid_attachment["attachmentReferences"] = [
+                {**base["attachmentReferences"][0], "sourceGuid": source_guid}
+            ]
+            cases[name] = invalid_attachment
 
         path_attachment = dict(base)
         path_attachment["attachmentReferences"] = [

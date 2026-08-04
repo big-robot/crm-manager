@@ -843,9 +843,14 @@ def normalized_phone(value):
 
 
 def valid_source_guid(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
     return (
-        isinstance(value, str)
-        and 0 < len(value.encode("utf-8")) <= 512
+        0 < len(encoded) <= 512
         and value == value.strip()
         and not any(ord(char) < 32 or ord(char) == 127 for char in value)
     )
@@ -1196,7 +1201,8 @@ def read_log_capture_input():
         mime_type = attachment.get("mimeType")
         size_bytes = attachment.get("sizeBytes")
         if (
-            source_guid not in source_guid_set
+            not valid_source_guid(source_guid)
+            or source_guid not in source_guid_set
             or not valid_capture_token(name)
             or "/" in name
             or "\\" in name
