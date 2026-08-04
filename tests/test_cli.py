@@ -927,6 +927,56 @@ class GhlCliTests(unittest.TestCase):
                 self.assertNotIn("Traceback", result.stderr)
                 self.assertEqual(len(server.requests), 1)
 
+    def test_private_commands_fail_closed_on_non_list_additional_phones(self):
+        command_inputs = {
+            "logged-messages": {
+                "contactName": "Synthetic Person",
+                "phone": "2025550101",
+                "sourceGuids": ["synthetic-guid-a"],
+            },
+            "log-capture": self.log_capture_input(),
+        }
+        for value_name, additional_phones in {
+            "integer": 42,
+            "boolean": True,
+        }.items():
+            for command, private_input in command_inputs.items():
+                with self.subTest(value=value_name, command=command):
+                    def respond(request):
+                        if request["path"] == "/contacts/search":
+                            return 200, {
+                                "contacts": [
+                                    {
+                                        "id": "contact-synthetic",
+                                        "locationId": "location-synthetic",
+                                        "name": "Synthetic Person",
+                                        "phone": "2025550101",
+                                        "additionalPhones": additional_phones,
+                                    }
+                                ]
+                            }
+                        return 500, {"private": "must not be returned"}
+
+                    with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(
+                        respond
+                    ) as server:
+                        result = self.run_cli(
+                            "conversations",
+                            command,
+                            cwd=tmp,
+                            env=self.synthetic_env(tmp, server),
+                            input_text=json.dumps(private_input),
+                        )
+
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(
+                        result.stderr,
+                        "error: contact resolution failed\n",
+                    )
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(len(server.requests), 1)
+
     def test_logged_messages_fails_closed_on_conversation_cardinality_or_association(self):
         cases = {
             "zero": [],

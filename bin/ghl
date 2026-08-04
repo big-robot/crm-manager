@@ -916,8 +916,13 @@ def contact_names(contact):
 
 
 def contact_phones(contact):
+    additional_phones = contact.get("additionalPhones")
+    if additional_phones is None:
+        additional_phones = []
+    if not isinstance(additional_phones, list):
+        return set()
     values = [contact.get("phone")]
-    for entry in contact.get("additionalPhones") or []:
+    for entry in additional_phones:
         if isinstance(entry, dict):
             values.append(entry.get("phone"))
     return {
