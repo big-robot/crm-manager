@@ -160,13 +160,19 @@ ghl contacts search --query "Example Co"
 ghl contacts get CONTACT_ID
 ghl tasks search --limit 100
 ghl users list
-ghl opportunities search --pipeline "Sales Pipeline" --status all
+ghl opportunities search --pipeline "Sales Pipeline" --status all --limit 20
+ghl opportunities search --pipeline "Sales Pipeline" --status open --all
 ghl tasks search --limit 100
 ghl conversations search --contact-id CONTACT_ID
 ghl conversations messages CONVERSATION_ID
 ghl conversations logged-messages # reads contactName, phone, and sourceGuids as private JSON on stdin
 ghl cleanup audit
 ```
+
+Opportunity search keeps `--limit` as a single bounded provider request. Use
+`--all` to follow the provider cursor through every matching page. Complete
+search prints only after exhaustion is established; invalid pagination state or
+a later-page failure exits without printing a partial opportunity list.
 
 `conversations logged-messages` is read-only. It resolves exactly one Contact
 and associated existing Conversation, reads all Internal Comments, and reports

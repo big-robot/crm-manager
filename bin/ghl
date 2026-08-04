@@ -17,6 +17,7 @@ BASE_URL = "https://services.leadconnectorhq.com"
 VERSION = "2021-07-28"
 TASKS_VERSION = "v3"
 TASK_SEARCH_PAGE_SIZE = 20
+OPPORTUNITY_SEARCH_PAGE_SIZE = 100
 CONVERSATIONS_VERSION = "2021-04-15"
 CONVERSATION_MESSAGES_VERSION = "v3"
 CLI_VERSION = "0.3.0"
@@ -559,17 +560,212 @@ def delete_contact(args):
     print_json(request("DELETE", f"/contacts/{args.id}", yes=args.yes) or {})
 
 
+class OpportunityPaginationError(RuntimeError):
+    pass
+
+
+def validate_opportunity_search_meta(meta, page_number, expected_total):
+    if not isinstance(meta, dict):
+        raise OpportunityPaginationError(
+            f"opportunity search page {page_number} returned malformed pagination metadata"
+        )
+
+    total = meta.get("total")
+    if total is not None:
+        valid_total = (
+            isinstance(total, (int, float))
+            and not isinstance(total, bool)
+            and math.isfinite(total)
+            and total >= 0
+            and total == int(total)
+        )
+        if not valid_total:
+            raise OpportunityPaginationError(
+                f"opportunity search page {page_number} returned a malformed pagination total"
+            )
+        total = int(total)
+        if expected_total is not None and total != expected_total:
+            raise OpportunityPaginationError(
+                f"opportunity search page {page_number} changed pagination total "
+                f"from {expected_total} to {total}"
+            )
+        expected_total = total
+
+    next_page = meta.get("nextPage")
+    if next_page is not None:
+        valid_next_page = (
+            isinstance(next_page, (int, float))
+            and not isinstance(next_page, bool)
+            and math.isfinite(next_page)
+            and next_page > 0
+            and next_page == int(next_page)
+        )
+        if not valid_next_page:
+            raise OpportunityPaginationError(
+                f"opportunity search page {page_number} returned a malformed nextPage value"
+            )
+
+    next_page_url = meta.get("nextPageUrl")
+    if next_page_url is not None and (
+        not isinstance(next_page_url, str) or not next_page_url.strip()
+    ):
+        raise OpportunityPaginationError(
+            f"opportunity search page {page_number} returned a malformed nextPageUrl value"
+        )
+    return expected_total, next_page is not None or next_page_url is not None
+
+
+def validate_opportunity_search_cursor(meta, page_number):
+    if "startAfter" not in meta or "startAfterId" not in meta:
+        raise OpportunityPaginationError(
+            f"opportunity search page {page_number} is missing pagination cursor fields"
+        )
+
+    start_after = meta["startAfter"]
+    start_after_id = meta["startAfterId"]
+    valid_timestamp = (
+        isinstance(start_after, (int, float))
+        and not isinstance(start_after, bool)
+        and math.isfinite(start_after)
+    ) or (
+        isinstance(start_after, str)
+        and re.fullmatch(r"[0-9]+", start_after) is not None
+    )
+    if not valid_timestamp or not isinstance(start_after_id, str) or not start_after_id:
+        raise OpportunityPaginationError(
+            f"opportunity search page {page_number} returned a malformed pagination cursor"
+        )
+    return {"startAfter": start_after, "startAfterId": start_after_id}
+
+
+def paginate_opportunity_search(fetch_page):
+    result = None
+    collected = []
+    seen_opportunity_ids = set()
+    cursor = None
+    seen_cursors = set()
+    page_number = 0
+    expected_total = None
+    terminal_meta = None
+
+    while True:
+        page_number += 1
+        page = fetch_page(cursor)
+        if not isinstance(page, dict):
+            raise OpportunityPaginationError(
+                f"opportunity search page {page_number} returned a malformed response"
+            )
+        opportunities = page.get("opportunities")
+        if not isinstance(opportunities, list):
+            raise OpportunityPaginationError(
+                f"opportunity search page {page_number} returned a malformed opportunities list"
+            )
+        if result is None:
+            result = dict(page)
+
+        meta = page.get("meta")
+        expected_total, meta_continues = validate_opportunity_search_meta(
+            meta, page_number, expected_total
+        )
+
+        page_opportunity_ids = set()
+        for index, opportunity in enumerate(opportunities):
+            if not isinstance(opportunity, dict):
+                raise OpportunityPaginationError(
+                    f"opportunity search page {page_number} returned a malformed "
+                    f"opportunity at index {index}"
+                )
+            opportunity_id = opportunity.get("id")
+            if not isinstance(opportunity_id, str) or not opportunity_id.strip():
+                raise OpportunityPaginationError(
+                    f"opportunity search page {page_number} returned a malformed "
+                    f"opportunity id at index {index}"
+                )
+            if (
+                opportunity_id in seen_opportunity_ids
+                or opportunity_id in page_opportunity_ids
+            ):
+                raise OpportunityPaginationError(
+                    f"opportunity search page {page_number} repeated opportunity id "
+                    f"{opportunity_id!r}"
+                )
+            page_opportunity_ids.add(opportunity_id)
+
+        seen_opportunity_ids.update(page_opportunity_ids)
+        collected.extend(opportunities)
+        if expected_total is not None and len(collected) > expected_total:
+            raise OpportunityPaginationError(
+                f"opportunity search collected {len(collected)} records, "
+                f"which exceeds pagination total {expected_total}"
+            )
+
+        should_continue = (
+            meta_continues
+            or len(opportunities) >= OPPORTUNITY_SEARCH_PAGE_SIZE
+        )
+        if should_continue and not opportunities:
+            raise OpportunityPaginationError(
+                f"opportunity search page {page_number} made no record progress"
+            )
+        if not should_continue:
+            if expected_total is not None and len(collected) != expected_total:
+                raise OpportunityPaginationError(
+                    f"opportunity search collected {len(collected)} records, "
+                    f"which does not match pagination total {expected_total}"
+                )
+            terminal_meta = dict(meta)
+            break
+
+        cursor = validate_opportunity_search_cursor(meta, page_number)
+        cursor_start_after = cursor["startAfter"]
+        if isinstance(cursor_start_after, str):
+            cursor_start_after_key = cursor_start_after.lstrip("0") or "0"
+        elif isinstance(cursor_start_after, float) and cursor_start_after.is_integer():
+            cursor_start_after_key = str(int(cursor_start_after))
+        else:
+            cursor_start_after_key = str(cursor_start_after)
+        cursor_key = (cursor_start_after_key, cursor["startAfterId"])
+        if cursor_key in seen_cursors:
+            raise OpportunityPaginationError(
+                f"opportunity search page {page_number} repeated its pagination cursor"
+            )
+        seen_cursors.add(cursor_key)
+
+    result = result or {"opportunities": []}
+    result["opportunities"] = collected
+    result["meta"] = terminal_meta
+    return result
+
+
 def search_opportunities(args):
-    query = {
+    base_query = {
         "location_id": location_id(),
-        "limit": args.limit,
         "status": args.status,
     }
     if args.query:
-        query["q"] = args.query
+        base_query["q"] = args.query
     if args.pipeline:
-        query["pipeline_id"] = find_pipeline(args.pipeline)["id"]
-    data = request("GET", "/opportunities/search", query=query)
+        base_query["pipeline_id"] = find_pipeline(args.pipeline)["id"]
+
+    if not args.all:
+        data = request(
+            "GET",
+            "/opportunities/search",
+            query={**base_query, "limit": args.limit},
+        )
+        print_json(data)
+        return
+
+    def fetch_page(cursor):
+        query = {**base_query, "limit": OPPORTUNITY_SEARCH_PAGE_SIZE}
+        if cursor is not None:
+            query.update(cursor)
+        return request("GET", "/opportunities/search", query=query)
+
+    try:
+        data = paginate_opportunity_search(fetch_page)
+    except OpportunityPaginationError as exc:
+        fail(str(exc))
     print_json(data)
 
 
@@ -1513,7 +1709,8 @@ Contacts:
 - Delete: ghl --yes contacts delete CONTACT_ID --confirm-delete CONTACT_ID
 
 Opportunities:
-- Search: ghl opportunities search --pipeline "{pipeline}" --status all --limit 100
+- Bounded search: ghl opportunities search --pipeline "{pipeline}" --status all --limit 100
+- Complete search: ghl opportunities search --pipeline "{pipeline}" --status open --all
 - Create: ghl --yes opportunities create --contact-id CONTACT_ID --name "{opportunity_name}" --pipeline "{pipeline}" --stage "Proposal Sent" --status open --value {annual_value} --field "Revenue Model=Monthly Recurring" --field "Monthly Amount={monthly_amount}" --field "Forecast Term Months=12" --field "Forecast Value Basis=First-year recurring value"
 - Update: ghl --yes opportunities update OPPORTUNITY_ID --pipeline "{pipeline}" --stage "Qualified" --value 0 --field "Next Step=Book discovery."
 - Next-step hygiene (only fields it can touch): ghl --yes opportunities next-step OPPORTUNITY_ID --step "Follow up after install." --date 2026-07-10
@@ -1738,7 +1935,13 @@ def build_parser():
     opp_search.add_argument("--query")
     opp_search.add_argument("--pipeline")
     opp_search.add_argument("--status", choices=["open", "won", "lost", "abandoned", "all"], default="all")
-    opp_search.add_argument("--limit", type=int, default=20)
+    opp_search_scope = opp_search.add_mutually_exclusive_group()
+    opp_search_scope.add_argument("--limit", type=int, default=20)
+    opp_search_scope.add_argument(
+        "--all",
+        action="store_true",
+        help="retrieve every matching opportunity across provider pages",
+    )
     opp_search.set_defaults(func=search_opportunities)
     opp_create = opps_sub.add_parser("create")
     opp_create.add_argument("--contact-id", required=True)
