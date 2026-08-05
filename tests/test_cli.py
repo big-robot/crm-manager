@@ -2082,6 +2082,32 @@ class GhlCliTests(unittest.TestCase):
             ],
         )
 
+    def test_opportunity_search_all_accepts_provider_terminal_sentinels(self):
+        page = {
+            "opportunities": [{"id": f"opp-{index}"} for index in range(12)],
+            "meta": {
+                "total": 12,
+                "currentPage": 1,
+                "nextPage": "",
+                "nextPageUrl": "https://services.leadconnectorhq.com/opportunities/search?startAfter=1&startAfterId=opp-11",
+                "startAfter": 1,
+                "startAfterId": "opp-11",
+            },
+        }
+
+        result, requests = self.run_cli_with_provider(
+            lambda _path, _query: page,
+            "opportunities",
+            "search",
+            "--status",
+            "open",
+            "--all",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), page)
+        self.assertEqual(len(requests), 1)
+
     def test_opportunity_search_all_combines_pages_and_reapplies_filters(self):
         opportunity_calls = 0
 

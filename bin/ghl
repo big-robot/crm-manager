@@ -592,7 +592,8 @@ def validate_opportunity_search_meta(meta, page_number, expected_total):
         expected_total = total
 
     next_page = meta.get("nextPage")
-    if next_page is not None:
+    next_page_continues = next_page is not None and next_page != ""
+    if next_page_continues:
         valid_next_page = (
             isinstance(next_page, (int, float))
             and not isinstance(next_page, bool)
@@ -612,7 +613,7 @@ def validate_opportunity_search_meta(meta, page_number, expected_total):
         raise OpportunityPaginationError(
             f"opportunity search page {page_number} returned a malformed nextPageUrl value"
         )
-    return expected_total, next_page is not None or next_page_url is not None
+    return expected_total, next_page_continues or next_page_url is not None
 
 
 def validate_opportunity_search_cursor(meta, page_number):
@@ -699,7 +700,12 @@ def paginate_opportunity_search(fetch_page):
                 f"which exceeds pagination total {expected_total}"
             )
 
-        should_continue = (
+        terminal_short_page = (
+            expected_total is not None
+            and len(collected) == expected_total
+            and len(opportunities) < OPPORTUNITY_SEARCH_PAGE_SIZE
+        )
+        should_continue = not terminal_short_page and (
             meta_continues
             or len(opportunities) >= OPPORTUNITY_SEARCH_PAGE_SIZE
         )
