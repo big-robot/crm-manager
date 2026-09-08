@@ -112,6 +112,8 @@ Recommended steady-state permissions:
 [
   "contacts.readonly",
   "contacts.write",
+  "businesses.readonly",
+  "businesses.write",
   "opportunities.readonly",
   "opportunities.write",
   "pipelines.readonly",
@@ -132,6 +134,8 @@ Notes:
 - Enable both read and write for contacts/opportunities/tags because the CLI
   searches before it writes.
 - `pipelines.readonly` is needed to resolve pipeline and stage ids by name.
+- `businesses.readonly` covers Business list/get and update/delete preflight;
+  `businesses.write` covers Business mutations in the configured sub-account.
 - The Conversations message write scope is used only by the fixed guarded
   `conversations log-capture` Internal Comment operation. The CLI exposes no
   generic send/reply/update/delete or customer-facing message write.
@@ -158,6 +162,8 @@ ghl fields --model opportunity
 ghl tags list
 ghl contacts search --query "Example Co"
 ghl contacts get CONTACT_ID
+ghl businesses list --limit 100 --skip 0
+ghl businesses get BUSINESS_ID
 ghl tasks search --limit 100
 ghl users list
 ghl opportunities search --pipeline "Sales Pipeline" --status all --limit 20
@@ -173,6 +179,39 @@ Opportunity search keeps `--limit` as a single bounded provider request. Use
 `--all` to follow the provider cursor through every matching page. Complete
 search prints only after exhaustion is established; invalid pagination state or
 a later-page failure exits without printing a partial opportunity list.
+
+### Businesses
+
+Businesses are organization records shown as Companies in a GHL sub-account,
+distinct from Agency Companies. CRUD does not require a Contact:
+
+```sh
+ghl businesses create --name "Example Co"
+ghl --yes businesses create --name "Example Co" --website "https://example.invalid"
+ghl --yes businesses update BUSINESS_ID --description "Example description"
+ghl --yes businesses delete BUSINESS_ID --confirm-delete BUSINESS_ID
+```
+
+Create requires `--name`; update accepts `--name`. Both accept optional `--phone`,
+`--email`, `--website`, `--address`, `--city`, `--postal-code`, `--state`,
+`--country`, and `--description`. Only supplied nonempty fields are sent, so a
+name-only update preserves existing metadata. Field clearing is not offered.
+Writes default to dry-run; scoped update/delete previews require read access.
+List returns one bounded provider page with default `--limit 100 --skip 0` and
+does not paginate automatically. `--limit` must be positive; `--skip` must be
+nonnegative.
+
+Before creating a Business, agents should offer known website, phone, email,
+address, and description values with their sources, and ask whether the user has
+additional details. Never invent missing values. This guidance does not add CLI
+prompts: name-only creation is valid using the configured location.
+
+Contact `--company` sets `companyName` text only; it does not establish a Business
+association. Business renames do not update Contacts. Business deletion issues
+no Contact writes; provider cascade behavior is unverified. If a write response
+cannot confirm success and identity, the CLI exits nonzero and reports the write
+as unconfirmed. It may already have occurred; no automatic retry or rollback is
+attempted.
 
 `conversations logged-messages` is read-only. It resolves exactly one Contact
 and associated existing Conversation, reads all Internal Comments, and reports
