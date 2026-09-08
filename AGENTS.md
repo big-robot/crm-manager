@@ -80,6 +80,40 @@ Business association.
 
 ## Contacts
 
+Assign or remove real Business relationships with repeated `--contact-id`:
+
+```sh
+ghl contacts business assign BUSINESS_ID --contact-id CONTACT_ID
+ghl --yes contacts business assign BUSINESS_ID --contact-id CONTACT_ID --contact-id SECOND_CONTACT_ID
+ghl --yes contacts business assign BUSINESS_ID --contact-id CONTACT_ID --replace
+ghl --yes contacts business remove BUSINESS_ID --contact-id CONTACT_ID
+```
+
+Each command accepts 1 to 50 unique IDs, without batch splitting. Preflight
+validates the Business and every Contact's identity/location before any write;
+it is a snapshot, not concurrent-change protection. Dry run shows existing and
+target associations, proposed names, and planned requests. Assignment requires
+`--replace` for a different existing Business and sets its current name as
+`companyName`. Removal rejects a different Business, clears text only on an
+exact case-sensitive match to the current Business name, and preserves differing
+text. Proven unassociated Contacts are removal no-ops and retain their text.
+
+Bulk association runs first. Only affirmatively returned IDs receive name
+updates. A valid subset permits those updates but exits nonzero for unconfirmed
+IDs. Each name PUT requires a scoped GET confirming the value; clearing sends
+JSON null and is confirmed by an omitted `companyName`. Failed requests,
+malformed bulk responses, or failed name readback stop later writes and report
+per-Contact confirmed, unconfirmed, and unattempted steps. Preserved/unchanged
+text is not a verified write. An unconfirmed write may have occurred; inspect
+provider state before continuing. There is no retry, rollback, or atomicity
+guarantee. Business renames leave text stale; assigning an already-associated
+Contact can repair it.
+
+Contact GET/PUT require `contacts.readonly`/`contacts.write`; Business reads
+require `businesses.readonly`. Business CRUD mutations require `businesses.write`.
+Bulk assignment/removal was verified with the current integration, but its
+isolated minimum scope was not established. Do not broaden permissions on failure.
+
 Search first to avoid duplicates:
 
 ```sh

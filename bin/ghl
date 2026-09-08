@@ -531,6 +531,156 @@ def get_contact(args):
     print_json(request("GET", f"/contacts/{args.id}"))
 
 
+def scoped_business_contact(contact_id):
+    data = request(
+        "GET", f"/contacts/{contact_id}", version=VERSION, sanitize_errors=True,
+    )
+    contact = data.get("contact") if isinstance(data, dict) else None
+    if (
+        not isinstance(contact, dict)
+        or contact.get("id") != contact_id
+        or contact.get("locationId") != location_id()
+        or ("businessId" in contact and (
+            not isinstance(contact["businessId"], str)
+            or (contact["businessId"] != "" and not valid_provider_id(contact["businessId"]))
+        ))
+        or ("companyName" in contact and not isinstance(contact["companyName"], str))
+    ):
+        fail("Contact response has invalid identity, location, association, or companyName")
+    return contact
+
+
+def assign_contact_business(args):
+    contact_business_change(args, removing=False)
+
+
+def remove_contact_business(args):
+    contact_business_change(args, removing=True)
+
+
+def contact_business_change(args, *, removing):
+    ids = args.contact_id
+    if (
+        not valid_provider_id(args.id) or not 1 <= len(ids) <= 50
+        or any(not valid_provider_id(contact_id) for contact_id in ids)
+        or len(set(ids)) != len(ids)
+    ):
+        fail("supply a valid Business id and 1 to 50 unique valid --contact-id values")
+
+    outcomes = [{"contactId": contact_id, "association": "unattempted", "companyName": "unattempted"} for contact_id in ids]
+    summary = {
+        "operation": "remove" if removing else "assign", "businessId": args.id,
+        "requestedIds": ids, "outcomes": outcomes,
+    }
+    current = None
+    try:
+        business = scoped_business(args.id)
+        contacts = []
+        for outcome in outcomes:
+            current = outcome
+            contact = scoped_business_contact(outcome["contactId"])
+            contacts.append(contact)
+            outcome["existingBusinessId"] = contact.get("businessId") or None
+            outcome["targetBusinessId"] = None if removing else args.id
+        # Complete all reads before evaluating or executing any mutation.
+        for outcome in outcomes:
+            current = outcome
+            existing = outcome["existingBusinessId"]
+            if existing and existing != args.id and (removing or not args.replace):
+                fail("Contact belongs to another Business; removal requires the expected Business, assignment requires --replace")
+    except (SystemExit, Exception):
+        if current is not None:
+            current["error"] = "Contact preflight failed; no writes attempted"
+        summary.update(status="failed", error="Preflight failed; no writes attempted")
+        print_json(summary)
+        raise SystemExit(1)
+
+    submitted = []
+    name_updates = {}
+    for outcome, contact in zip(outcomes, contacts):
+        contact_id = outcome["contactId"]
+        if removing and not outcome["existingBusinessId"]:
+            outcome.update(association="noop", companyName="preserved")
+            continue
+        submitted.append(contact_id)
+        if removing:
+            if contact.get("companyName") == business["name"]:
+                name_updates[contact_id] = None
+            else:
+                outcome["companyName"] = "preserved"
+        elif contact.get("companyName") != business["name"]:
+            name_updates[contact_id] = business["name"]
+        else:
+            outcome["companyName"] = "unchanged"
+        if contact_id in name_updates:
+            outcome["proposedCompanyName"] = name_updates[contact_id]
+
+    bulk_body = {"locationId": location_id(), "ids": submitted, "businessId": None if removing else args.id}
+    if not args.yes:
+        planned = []
+        if submitted:
+            planned.append({"method": "POST", "path": "/contacts/bulk/business", "version": "v3", "body": bulk_body})
+        for contact_id, name in name_updates.items():
+            planned.extend([
+                {"method": "PUT", "path": f"/contacts/{contact_id}", "version": VERSION, "body": {"companyName": name}},
+                {"method": "GET", "path": f"/contacts/{contact_id}", "version": VERSION},
+            ])
+        summary.update(dryRun=True, status="planned", plannedRequests=planned)
+        print_json(summary)
+        return
+
+    confirmed = set()
+    if submitted:
+        for outcome in outcomes:
+            if outcome["contactId"] in submitted:
+                outcome["association"] = "unconfirmed"
+        try:
+            data = request("POST", "/contacts/bulk/business", body=bulk_body, yes=True, version="v3", sanitize_errors=True)
+            returned = data.get("ids") if isinstance(data, dict) else None
+            if (
+                not isinstance(data, dict) or data.get("success") is not True
+                or not isinstance(returned, list)
+                or any(not valid_provider_id(value) for value in returned)
+                or len(set(returned)) != len(returned)
+                or not set(returned).issubset(submitted)
+            ):
+                fail("Invalid Business association response")
+            confirmed = set(returned)
+        except (SystemExit, Exception):
+            summary.update(status="indeterminate", error="Association write unconfirmed; it may have occurred. No later writes attempted")
+            print_json(summary)
+            raise SystemExit(1)
+        for outcome in outcomes:
+            if outcome["contactId"] in confirmed:
+                outcome["association"] = "confirmed"
+
+    for outcome in outcomes:
+        contact_id = outcome["contactId"]
+        if contact_id not in confirmed or contact_id not in name_updates:
+            continue
+        name = name_updates[contact_id]
+        outcome["companyName"] = "unconfirmed"
+        try:
+            request("PUT", f"/contacts/{contact_id}", body={"companyName": name}, yes=True, version=VERSION, sanitize_errors=True)
+            saved = scoped_business_contact(contact_id)
+            if (name is None and "companyName" in saved) or (name is not None and saved.get("companyName") != name):
+                fail("Contact companyName readback did not confirm the intended value")
+        except (SystemExit, Exception):
+            outcome["error"] = "companyName write unconfirmed; it may have occurred"
+            summary.update(status="partial", error="companyName update unconfirmed; no later writes attempted")
+            print_json(summary)
+            raise SystemExit(1)
+        outcome["companyName"] = "confirmed"
+
+    incomplete = len(confirmed) != len(submitted)
+    summary["status"] = "partial" if incomplete else "complete"
+    if incomplete:
+        summary["error"] = "Some association writes remain unconfirmed; no retry or rollback attempted"
+    print_json(summary)
+    if incomplete:
+        raise SystemExit(1)
+
+
 PHONE_LABELS = {
     "home": "Home",
     "work": "Work",
@@ -1838,6 +1988,15 @@ Businesses (sub-account Company records, independent of Contacts):
 - Contact --company sets companyName text only; it does not establish a Business association.
 
 Contacts:
+- Business dry run: ghl contacts business assign BUSINESS_ID --contact-id CONTACT_ID
+- Assign: ghl --yes contacts business assign BUSINESS_ID --contact-id CONTACT_ID --contact-id SECOND_CONTACT_ID
+- Replace another Business: ghl --yes contacts business assign BUSINESS_ID --contact-id CONTACT_ID --replace
+- Remove expected Business: ghl --yes contacts business remove BUSINESS_ID --contact-id CONTACT_ID
+- Accepts 1 to 50 unique Contact IDs; no batch splitting. All identity/location reads and conflicts are checked before writes. Preflight is a snapshot, not concurrent-change protection.
+- Assignment sets companyName to the Business name and can repair stale text after a rename. Removal clears only an exact case-sensitive name match; differing text survives. Proven unassociated removal is a no-op and preserves text.
+- Dry run shows existing/target associations, proposed names, and planned requests. Bulk association precedes minimal name PUTs and scoped GET readbacks. Only affirmatively returned IDs receive name updates; a valid subset exits nonzero for unconfirmed IDs.
+- Name clearing sends JSON null and requires an omitted companyName on readback. Preserved/unchanged text is not a verified write. Failures stop later writes and report per-Contact confirmed/unconfirmed/unattempted outcomes. Unconfirmed writes may have occurred; inspect state before continuing. No retry, rollback, or atomicity guarantee.
+- Business reads require businesses.readonly; Contact GET/PUT require contacts.readonly/contacts.write. Bulk operations worked with the current integration; isolated minimum scope is unknown. Do not broaden permissions on failure.
 - Search: ghl contacts search --query "{contact_query}" --limit 20
 - Exact read: ghl contacts get CONTACT_ID
 - Create (may trigger configured location automations): ghl --yes contacts create --name "{contact_name}" --email "{contact_email}" --company "{company_name}"
@@ -2058,6 +2217,15 @@ def build_parser():
 
     contacts = sub.add_parser("contacts")
     contacts_sub = contacts.add_subparsers(dest="contacts_command", required=True)
+    contact_business = contacts_sub.add_parser("business", help="assign or remove a real Business association and maintain companyName")
+    contact_business_sub = contact_business.add_subparsers(dest="contact_business_command", required=True)
+    for command, handler in (("assign", assign_contact_business), ("remove", remove_contact_business)):
+        association = contact_business_sub.add_parser(command)
+        association.add_argument("id", metavar="BUSINESS_ID")
+        association.add_argument("--contact-id", action="append", required=True, help="repeat for 1 to 50 unique Contacts")
+        if command == "assign":
+            association.add_argument("--replace", action="store_true", help="allow replacing an existing Business association")
+        association.set_defaults(func=handler)
     contact_search = contacts_sub.add_parser("search")
     contact_search.add_argument("--query")
     contact_search.add_argument("--limit", type=int, default=20)
