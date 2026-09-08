@@ -482,6 +482,10 @@ def get_business(args):
 
 
 def business_mutation(method, path, *, body=None, yes=False, expected_id=None):
+    if yes:
+        # Local setup failures cannot leave a provider write unconfirmed.
+        api_base_url()
+        token()
     try:
         data = request(
             method, path, body=body, yes=yes,

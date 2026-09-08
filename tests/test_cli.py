@@ -243,6 +243,46 @@ class GhlCliTests(unittest.TestCase):
                         self.assertNotIn("PRIVATE_PROVIDER_ERROR", result.stderr)
                         self.assertEqual(len([request for request in server.requests if request["method"] != "GET"]), 1)
 
+    def test_businesses_local_preflight_failures(self):
+        commands = {
+            "list": [],
+            "get": ["business-synthetic"],
+            "create": ["--name", "Synthetic Business"],
+            "update": ["business-synthetic", "--name", "Synthetic Business"],
+            "delete": ["business-synthetic", "--confirm-delete", "business-synthetic"],
+        }
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(lambda request: (500, {})) as server:
+            help_result = self.run_cli("businesses", "--help", cwd=tmp, env=clean_env(tmp))
+            self.assertEqual(help_result.returncode, 0, help_result.stderr)
+            self.assertEqual(set(commands), set(help_result.stdout.split("{")[1].split("}")[0].split(",")))
+            cases = [
+                ({"GHL_PRIVATE_INTEGRATION_TOKEN": None, "GHL_TEST_BASE_URL": None}, "missing GHL_PRIVATE_INTEGRATION_TOKEN"),
+                ({"GHL_PRIVATE_INTEGRATION_TOKEN": "", "GHL_TEST_BASE_URL": None}, "missing GHL_PRIVATE_INTEGRATION_TOKEN"),
+                ({"GHL_LOCATION_ID": None}, "missing GHL_LOCATION_ID"),
+                ({"GHL_PRIVATE_INTEGRATION_TOKEN": None}, "test API endpoint requires explicit credentials"),
+                ({"GHL_TEST_BASE_URL": "https://example.invalid"}, "invalid test API endpoint"),
+                ({"GHL_TEST_BASE_URL": server.url + "/private-path"}, "invalid test API endpoint"),
+                ({"GHL_TEST_BASE_URL": "http://127.0.0.1:invalid"}, "invalid test API endpoint"),
+                ({"GHL_PRIVATE_INTEGRATION_TOKEN": None, "GHL_TEST_BASE_URL": None, "GHL_ENV_FILE": tmp}, "could not read env file"),
+            ]
+            for changes, error in cases:
+                for command, flags in commands.items():
+                    with self.subTest(command=command, changes=changes):
+                        env = self.synthetic_env(tmp, server)
+                        for key, value in changes.items():
+                            if value is None:
+                                env.pop(key, None)
+                            else:
+                                env[key] = value
+                        result = self.run_cli("--yes", "businesses", command, *flags, cwd=tmp, env=env)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, "")
+                        self.assertIn(error, result.stderr)
+                        self.assertNotIn("unconfirmed", result.stderr)
+                        self.assertNotIn("may have occurred", result.stderr)
+                        self.assertNotIn("token-synthetic", result.stderr)
+                        self.assertEqual(server.requests, [])
+
     def test_businesses_help_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = clean_env(tmp)
