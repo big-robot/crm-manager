@@ -213,6 +213,53 @@ cannot confirm success and identity, the CLI exits nonzero and reports the write
 as unconfirmed. It may already have occurred; no automatic retry or rollback is
 attempted.
 
+### Contact Business associations
+
+```sh
+ghl contacts business assign BUSINESS_ID --contact-id CONTACT_ID
+ghl --yes contacts business assign BUSINESS_ID --contact-id CONTACT_ID --contact-id SECOND_CONTACT_ID
+ghl --yes contacts business assign BUSINESS_ID --contact-id CONTACT_ID --replace
+ghl --yes contacts business remove BUSINESS_ID --contact-id CONTACT_ID
+```
+
+Assignment sets the real Business relationship and synchronizes `companyName`
+to that Business's current name. Replacing another Business requires `--replace`.
+Removal requires the expected Business ID and rejects a different association.
+It clears `companyName` with JSON null only when the text exactly matches the
+Business's current name, including case. Differing text is preserved. A proven
+unassociated Contact is a removal no-op, including its text.
+
+Each command accepts 1 to 50 unique Contact IDs and validates the Business and
+every Contact's identity and configured location before writing. There is no
+batch splitting. Dry runs show existing and target associations, proposed name
+updates, and planned requests; reads still run. Preflight is a snapshot and does
+not prevent concurrent changes.
+
+One bulk association write precedes the minimal name updates. Only IDs
+affirmatively returned by the bulk operation can receive a name update; a valid
+subset leaves other IDs unconfirmed and exits nonzero. Each name PUT is followed
+by a scoped Contact GET to confirm the saved value. Clearing is confirmed only
+when the GET omits `companyName`. A PUT response alone is not proof of a saved
+name. Preserved or unchanged text is reported as such, not as a verified write.
+
+Results include one outcome per requested Contact. `confirmed` identifies a
+verified step, `unconfirmed` means a write may have occurred, and `unattempted`
+means that step was not sent. `noop`, `preserved`, and `unchanged` describe the
+preflight decisions. Failed preflight sends no writes. A request failure,
+malformed bulk result, or failed name readback stops later writes and exits
+nonzero with prior progress. No retry, rollback, or transaction guarantee is
+provided. Inspect provider state before deciding how to continue.
+
+Business reads require `businesses.readonly`; Business CRUD mutations require
+`businesses.write`. Contact GET and PUT require `contacts.readonly` and
+`contacts.write`, respectively. Bulk assignment/removal worked with the current
+integration, but its isolated minimum scope was not established. Authorization
+failures stop the command; they do not broaden permissions.
+
+Business renames leave Contact text stale until explicitly repaired, for example
+by assigning the already-associated Contacts again. Contact `--company` remains
+text-only and neither creates a Business nor establishes an association.
+
 `conversations logged-messages` is read-only. It resolves exactly one Contact
 and associated existing Conversation, reads all Internal Comments, and reports
 `none`, `exact`, `partial`, or fail-closed `indeterminate` overlap. Pass its

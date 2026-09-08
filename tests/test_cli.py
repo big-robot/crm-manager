@@ -64,6 +64,9 @@ class SyntheticGhlServer:
                 owner.requests.append(request)
                 response = owner.callback(request)
                 status, payload = response[:2]
+                if status is None:
+                    self.close_connection = True
+                    return
                 response_headers = response[2] if len(response) == 3 else {}
                 encoded = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
                 self.send_response(status)
@@ -97,6 +100,267 @@ class SyntheticGhlServer:
 
 
 class GhlCliTests(unittest.TestCase):
+    def contact_business_run(self, records, *, operation="assign", extra=(), override=None, yes=True):
+        business = {"id": "business-synthetic-a", "locationId": "location-synthetic", "name": "Synthetic Business"}
+        counts = {}
+        written = set()
+        def respond(request):
+            contact_id = request["path"].split("/")[-1]
+            if request["path"].startswith("/businesses/"):
+                phase, payload = "business", {"business": business.copy()}
+            elif request["method"] == "POST":
+                self.assertEqual(request["path"], "/contacts/bulk/business")
+                self.assertEqual(request["body"]["locationId"], "location-synthetic")
+                phase, payload = "bulk", {"success": True, "ids": request["body"]["ids"]}
+                for target in request["body"]["ids"]:
+                    records[target]["businessId"] = request["body"]["businessId"] or ""
+            elif request["method"] == "PUT":
+                self.assertEqual(set(request["body"]), {"companyName"})
+                value = request["body"]["companyName"]
+                if value is None:
+                    records[contact_id].pop("companyName", None)
+                elif value != "":  # Observed provider behavior: empty string does not clear.
+                    records[contact_id]["companyName"] = value
+                written.add(contact_id)
+                phase, payload = "name", {}
+            else:
+                phase = "readback" if contact_id in written else "contact"
+                payload = {"contact": records[contact_id].copy()}
+            counts[phase] = counts.get(phase, 0) + 1
+            if override:
+                replacement = override(phase, counts[phase], request, payload)
+                if replacement is not None:
+                    return replacement
+            return 200, payload
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            flags = [item for contact_id in records for item in ("--contact-id", contact_id)]
+            result = self.run_cli(*(["--yes"] if yes else []), "contacts", "business", operation, business["id"], *flags, *extra, cwd=tmp, env=self.synthetic_env(tmp, server))
+            self.assertNotIn("PRIVATE_PROVIDER_ERROR", result.stdout + result.stderr)
+            self.assertNotIn("PRIVATE_CONTACT_FIELD", result.stdout + result.stderr)
+            self.assertNotIn("token-synthetic", result.stdout + result.stderr)
+            for request in server.requests:
+                self.assertEqual(request["version"], "v3" if request["path"].startswith("/businesses/") or request["method"] == "POST" else "2021-07-28")
+            return result, json.loads(result.stdout), server.requests
+
+    def contact_business_records(self, count=1, **fields):
+        return {
+            f"contact-synthetic-{chr(97 + index)}": {
+                "id": f"contact-synthetic-{chr(97 + index)}", "locationId": "location-synthetic",
+                "private": "PRIVATE_CONTACT_FIELD", **fields,
+            }
+            for index in range(count)
+        }
+
+    def test_contact_business_assignment_states(self):
+        cases = [({}, ()), ({"businessId": ""}, ()), ({"businessId": "business-synthetic-a", "companyName": "Stale Synthetic Name"}, ()), ({"businessId": "business-other"}, ("--replace",)), ({"businessId": "business-synthetic-a", "companyName": "Synthetic Business"}, ())]
+        for fields, extra in cases:
+            with self.subTest(fields=fields):
+                records = self.contact_business_records(**fields)
+                result, summary, requests = self.contact_business_run(records, extra=extra)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(summary["status"], "complete")
+                self.assertEqual(records["contact-synthetic-a"]["businessId"], "business-synthetic-a")
+                self.assertEqual(records["contact-synthetic-a"]["companyName"], "Synthetic Business")
+                self.assertEqual(summary["outcomes"][0]["association"], "confirmed")
+                self.assertEqual(summary["outcomes"][0]["companyName"], "unchanged" if fields.get("companyName") == "Synthetic Business" else "confirmed")
+                self.assertEqual([r["method"] for r in requests], ["GET", "GET", "POST"] + ([] if fields.get("companyName") == "Synthetic Business" else ["PUT", "GET"]))
+
+    def test_contact_business_removal_states(self):
+        cases = [({"businessId": "business-synthetic-a", "companyName": "Synthetic Business"}, "confirmed"), ({"businessId": "business-synthetic-a", "companyName": "synthetic business"}, "preserved"), ({"businessId": "business-synthetic-a"}, "preserved"), ({"companyName": "Synthetic Business"}, "preserved"), ({"businessId": "", "companyName": "Synthetic Business"}, "preserved")]
+        for fields, name_status in cases:
+            with self.subTest(fields=fields):
+                records = self.contact_business_records(**fields)
+                result, summary, requests = self.contact_business_run(records, operation="remove")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                outcome = summary["outcomes"][0]
+                self.assertEqual(outcome["companyName"], name_status)
+                if name_status == "confirmed":
+                    self.assertNotIn("companyName", records["contact-synthetic-a"])
+                    self.assertEqual([r["body"] for r in requests if r["method"] == "PUT"], [{"companyName": None}])
+                else:
+                    self.assertEqual(records["contact-synthetic-a"].get("companyName"), fields.get("companyName"))
+                    self.assertFalse(any(r["method"] == "PUT" for r in requests))
+                writes = [r for r in requests if r["method"] == "POST"]
+                self.assertEqual(len(writes), int(bool(fields.get("businessId"))))
+                if writes:
+                    self.assertIsNone(writes[0]["body"]["businessId"])
+                else:
+                    self.assertEqual(outcome["association"], "noop")
+
+    def test_contact_business_command_inventory_and_conflicts(self):
+        parser = runpy.run_path(str(CLI))["build_parser"]()
+        def commands(parser):
+            return next(action.choices for action in parser._actions if isinstance(action.choices, dict))
+        inventory = commands(commands(commands(parser)["contacts"])["business"])
+        self.assertEqual(set(inventory), {"assign", "remove"})
+        for operation in inventory:
+            records = self.contact_business_records(3)
+            records["contact-synthetic-b"]["businessId"] = "business-other"
+            result, summary, requests = self.contact_business_run(records, operation=operation)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(len(summary["outcomes"]), 3)
+            self.assertEqual([r["method"] for r in requests], ["GET"] * 4)
+            self.assertTrue(all(o["association"] == "unattempted" for o in summary["outcomes"]))
+
+    def test_contact_business_preflight_failures(self):
+        good = self.contact_business_records()["contact-synthetic-a"]
+        bad = [None, [], {}, {**good, "id": "contact-other"}, {**good, "locationId": "location-other"}]
+        bad += [{**good, "businessId": value} for value in (None, False, 0, [], {}, "../bad")]
+        bad += [{**good, "companyName": value} for value in (None, [], {})]
+        bad += [{key: value for key, value in good.items() if key != omitted} for omitted in ("id", "locationId")]
+        responses = [(200, {"contact": contact}) for contact in bad]
+        responses += [(status, {"private": "PRIVATE_PROVIDER_ERROR"}) for status in (403, 404, 429)]
+        responses += [(200, value) for value in (b"PRIVATE_PROVIDER_ERROR", b"\xff", {}, [])]
+        for response in responses:
+            with self.subTest(response=response):
+                result, summary, requests = self.contact_business_run(self.contact_business_records(3), override=lambda phase, count, request, payload: response if phase == "contact" and count == 2 else None)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(summary["status"], "failed")
+                self.assertTrue(all(r["method"] == "GET" for r in requests))
+                self.assertTrue(all(o["association"] == "unattempted" for o in summary["outcomes"]))
+        for business in ({}, {"id": "business-other", "locationId": "location-synthetic", "name": "Synthetic"}, {"id": "business-synthetic-a", "locationId": "foreign", "name": "Synthetic"}, {"id": "business-synthetic-a", "locationId": "location-synthetic", "name": ""}):
+            result, summary, requests = self.contact_business_run(self.contact_business_records(), override=lambda phase, count, request, payload: (200, {"business": business}) if phase == "business" else None)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(len(requests), 1)
+
+    def test_contact_business_input_bounds(self):
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(lambda request: (500, {})) as server:
+            for operation in ("assign", "remove"):
+                for ids in ([], ["same", "same"], ["../bad"], [""], ["x" * 257], [f"contact-{i}" for i in range(51)]):
+                    flags = [item for contact_id in ids for item in ("--contact-id", contact_id)]
+                    result = self.run_cli("--yes", "contacts", "business", operation, "business-synthetic-a", *flags, cwd=tmp, env=self.synthetic_env(tmp, server))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(server.requests, [])
+                result = self.run_cli("--yes", "contacts", "business", operation, "../bad", "--contact-id", "contact-a", cwd=tmp, env=self.synthetic_env(tmp, server))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(server.requests, [])
+            result = self.run_cli("contacts", "business", "remove", "business-a", "--contact-id", "contact-a", "--replace", cwd=tmp, env=self.synthetic_env(tmp, server))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(server.requests, [])
+        records = {f"contact-synthetic-{i}": {"id": f"contact-synthetic-{i}", "locationId": "location-synthetic"} for i in range(50)}
+        result, summary, requests = self.contact_business_run(records)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(summary["outcomes"]), 50)
+        self.assertEqual(sum(r["method"] == "POST" for r in requests), 1)
+        self.assertTrue(all(c["companyName"] == "Synthetic Business" for c in records.values()))
+
+    def test_contact_business_dry_run(self):
+        for operation in ("assign", "remove"):
+            records = self.contact_business_records(2, businessId="business-synthetic-a", companyName="Synthetic Business" if operation == "remove" else "Stale Synthetic Name")
+            original = json.loads(json.dumps(records))
+            result, summary, requests = self.contact_business_run(records, operation=operation, yes=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(summary["dryRun"])
+            self.assertEqual(records, original)
+            self.assertTrue(all(r["method"] == "GET" for r in requests))
+            self.assertEqual([r["method"] for r in summary["plannedRequests"]], ["POST", "PUT", "GET", "PUT", "GET"])
+            self.assertEqual(summary["plannedRequests"][0]["body"], {"locationId": "location-synthetic", "ids": list(records), "businessId": None if operation == "remove" else "business-synthetic-a"})
+            for outcome in summary["outcomes"]:
+                self.assertEqual(outcome["existingBusinessId"], "business-synthetic-a")
+                self.assertEqual(outcome["proposedCompanyName"], None if operation == "remove" else "Synthetic Business")
+
+    def test_contact_business_bulk_unconfirmed(self):
+        ids = ["contact-synthetic-a", "contact-synthetic-b", "contact-synthetic-c"]
+        payloads = [None, [], {}, {"success": False, "ids": ids}, {"ids": ids}, {"success": True}]
+        payloads += [{"success": value, "ids": ids} for value in (None, "true", 1)]
+        payloads += [{"success": True, "ids": value} for value in (None, "contact-synthetic-a", [ids[0], ids[0]], ["contact-other"], [None], [[]])]
+        responses = [(200, payload) for payload in payloads]
+        responses += [(429, {"private": "PRIVATE_PROVIDER_ERROR"}), (200, b"PRIVATE_PROVIDER_ERROR"), (200, b"", {"Content-Length": "100"}), (None, b"")]
+        for response in responses:
+            with self.subTest(response=response):
+                result, summary, requests = self.contact_business_run(self.contact_business_records(3), override=lambda phase, count, request, payload: response if phase == "bulk" else None)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(summary["status"], "indeterminate")
+                self.assertTrue(all(o["association"] == "unconfirmed" and o["companyName"] == "unattempted" for o in summary["outcomes"]))
+                self.assertEqual([r["method"] for r in requests], ["GET"] * 4 + ["POST"])
+
+    def test_contact_business_bulk_subset(self):
+        for returned in ([], ["contact-synthetic-a"], ["contact-synthetic-c", "contact-synthetic-a"]):
+            records = self.contact_business_records(3)
+            result, summary, requests = self.contact_business_run(records, override=lambda phase, count, request, payload: (200, {"success": True, "ids": returned}) if phase == "bulk" else None)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(summary["status"], "partial")
+            self.assertEqual({r["path"].split("/")[-1] for r in requests if r["method"] == "PUT"}, set(returned))
+            for outcome in summary["outcomes"]:
+                matched = outcome["contactId"] in returned
+                self.assertEqual(outcome["association"], "confirmed" if matched else "unconfirmed")
+                self.assertEqual(outcome["companyName"], "confirmed" if matched else "unattempted")
+                self.assertEqual(records[outcome["contactId"]].get("companyName"), "Synthetic Business" if matched else None)
+
+    def test_contact_business_name_failures_stop_and_report(self):
+        failures = [("name", (429, {"private": "PRIVATE_PROVIDER_ERROR"})), ("name", (200, b"PRIVATE_PROVIDER_ERROR")), ("name", (200, b"", {"Content-Length": "100"})), ("name", (None, b"")), ("readback", (404, {"private": "PRIVATE_PROVIDER_ERROR"})), ("readback", (200, {})), ("readback", (200, b"PRIVATE_PROVIDER_ERROR")), ("readback", (None, b""))]
+        good = self.contact_business_records(3)["contact-synthetic-b"]
+        failures += [("readback", (200, {"contact": {**good, **change}})) for change in ({"companyName": "Unchanged Synthetic Name"}, {"locationId": "foreign"}, {"id": "contact-other"}, {"businessId": None})]
+        for phase_to_fail, response in failures:
+            with self.subTest(phase=phase_to_fail, response=response):
+                result, summary, requests = self.contact_business_run(self.contact_business_records(3), override=lambda phase, count, request, payload: response if phase == phase_to_fail and count == 2 else None)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(summary["status"], "partial")
+                self.assertEqual([o["association"] for o in summary["outcomes"]], ["confirmed"] * 3)
+                self.assertEqual([o["companyName"] for o in summary["outcomes"]], ["confirmed", "unconfirmed", "unattempted"])
+                self.assertEqual(sum(r["method"] == "PUT" for r in requests), 2)
+        for put_response in ({}, {"succeded": True, "contact": {**good, "companyName": "Synthetic Business"}}):
+            def override(phase, count, request, payload):
+                if phase == "name":
+                    return 200, put_response
+                if phase == "readback":
+                    return 200, {"contact": self.contact_business_records()["contact-synthetic-a"]}
+            result, summary, requests = self.contact_business_run(self.contact_business_records(3), override=override)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual([o["companyName"] for o in summary["outcomes"]], ["unconfirmed", "unattempted", "unattempted"])
+            self.assertEqual(sum(r["method"] == "PUT" for r in requests), 1)
+
+    def test_contact_business_removal_subset_and_readback(self):
+        records = self.contact_business_records(3, businessId="business-synthetic-a", companyName="Synthetic Business")
+        records["contact-synthetic-c"]["businessId"] = ""
+        result, summary, requests = self.contact_business_run(records, operation="remove", override=lambda phase, count, request, payload: (200, {"success": True, "ids": ["contact-synthetic-a"]}) if phase == "bulk" else None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([o["association"] for o in summary["outcomes"]], ["confirmed", "unconfirmed", "noop"])
+        self.assertEqual([o["companyName"] for o in summary["outcomes"]], ["confirmed", "unattempted", "preserved"])
+        self.assertEqual(next(r["body"]["ids"] for r in requests if r["method"] == "POST"), ["contact-synthetic-a", "contact-synthetic-b"])
+        self.assertNotIn("companyName", records["contact-synthetic-a"])
+        self.assertEqual(records["contact-synthetic-c"]["companyName"], "Synthetic Business")
+        for value in ("", None, "Synthetic Business"):
+            def override(phase, count, request, payload):
+                if phase == "readback":
+                    payload["contact"]["companyName"] = value
+                    return 200, payload
+            result, summary, requests = self.contact_business_run(self.contact_business_records(2, businessId="business-synthetic-a", companyName="Synthetic Business"), operation="remove", override=override)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual([o["companyName"] for o in summary["outcomes"]], ["unconfirmed", "unattempted"])
+            self.assertEqual(sum(r["method"] == "PUT" for r in requests), 1)
+
+    def test_contact_business_company_compatibility(self):
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(lambda request: (200, {})) as server:
+            for command, flags in (("create", ["--name", "Synthetic Contact"]), ("upsert", ["--name", "Synthetic Contact"]), ("update", ["contact-synthetic-a"])):
+                server.requests.clear()
+                result = self.run_cli("--yes", "contacts", command, *flags, "--company", "Synthetic Business", cwd=tmp, env=self.synthetic_env(tmp, server))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(server.requests), 1)
+                self.assertEqual(server.requests[0]["body"]["companyName"], "Synthetic Business")
+                self.assertNotIn("businessId", server.requests[0]["body"])
+                self.assertNotEqual(server.requests[0]["path"], "/contacts/bulk/business")
+
+    def test_contact_business_assign(self):
+        contact = {"id": "contact-synthetic-a", "locationId": "location-synthetic"}
+        business = {"id": "business-synthetic-a", "locationId": "location-synthetic", "name": "Synthetic Business"}
+        def respond(request):
+            if request["path"].startswith("/businesses/"):
+                return 200, {"business": business}
+            if request["method"] == "POST":
+                contact["businessId"] = request["body"]["businessId"]
+                return 200, {"success": True, "ids": request["body"]["ids"]}
+            if request["method"] == "PUT":
+                contact.update(request["body"])
+                return 200, {}
+            return 200, {"contact": contact.copy()}
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            result = self.run_cli("--yes", "contacts", "business", "assign", business["id"], "--contact-id", contact["id"], cwd=tmp, env=self.synthetic_env(tmp, server))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(contact["businessId"], business["id"])
+            self.assertEqual(contact["companyName"], business["name"])
+
     def test_businesses_create_update(self):
         fields = {
             "name": "Synthetic Business", "phone": "+15550101001", "email": "business@example.invalid",
