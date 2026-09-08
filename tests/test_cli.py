@@ -40,6 +40,12 @@ class SyntheticGhlServer:
             def do_POST(self):
                 self.handle_request()
 
+            def do_PUT(self):
+                self.handle_request()
+
+            def do_DELETE(self):
+                self.handle_request()
+
             def handle_request(self):
                 length = int(self.headers.get("Content-Length", "0"))
                 raw_body = self.rfile.read(length) if length else b""
@@ -88,6 +94,192 @@ class SyntheticGhlServer:
 
 
 class GhlCliTests(unittest.TestCase):
+    def test_businesses_create_update(self):
+        fields = {
+            "name": "Synthetic Business", "phone": "+15550101001", "email": "business@example.invalid",
+            "website": "https://example.invalid", "address": "1 Synthetic Street", "city": "Synthetic City",
+            "postal_code": "00000", "state": "Synthetic State", "country": "US", "description": "Synthetic description",
+        }
+        cli = runpy.run_path(str(CLI))
+        self.assertEqual(set(fields), set(cli["BUSINESS_FIELDS"]))
+        expected = {key if key != "postal_code" else "postalCode": value for key, value in fields.items()}
+        business = {"id": "business-synthetic", "locationId": "location-synthetic", **expected}
+        def respond(request):
+            if request["method"] != "GET":
+                business.update(request["body"])
+                return 200, {"success": True, "business": business.copy()}
+            return 200, {"business": business.copy()}
+        flags = [item for key, value in fields.items() for item in ("--" + key.replace("_", "-"), value)]
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            env = self.synthetic_env(tmp, server)
+            for command in ("create", "update"):
+                with self.subTest(command=command):
+                    command_args = ["businesses", command] + ([business["id"]] if command == "update" else [])
+                    result = self.run_cli("--yes", *command_args, *flags, cwd=tmp, env=env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {"success": True, "business": business})
+                    request = server.requests[-1]
+                    self.assertEqual(request["method"], "POST" if command == "create" else "PUT")
+                    self.assertEqual(request["path"], "/businesses/" if command == "create" else "/businesses/business-synthetic")
+                    self.assertEqual(request["body"], {**expected, **({"locationId": "location-synthetic"} if command == "create" else {})})
+                    empty_flags = [item for key in fields if key != "name" for item in ("--" + key.replace("_", "-"), " ")]
+                    result = self.run_cli("--yes", *command_args, "--name", "Synthetic Business", *empty_flags, cwd=tmp, env=env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(server.requests[-1]["body"], {"name": "Synthetic Business", **({"locationId": "location-synthetic"} if command == "create" else {})})
+            result = self.run_cli("--yes", "businesses", "update", business["id"], "--name", "Renamed Synthetic Business", "--phone", "  ", cwd=tmp, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(server.requests[-1]["body"], {"name": "Renamed Synthetic Business"})
+            self.assertEqual(json.loads(result.stdout)["business"]["description"], fields["description"])
+            result = self.run_cli("--yes", "businesses", "create", "--name", "Synthetic Business", cwd=tmp, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(server.requests[-1]["body"], {"name": "Synthetic Business", "locationId": "location-synthetic"})
+            self.assertTrue(all(request["version"] == "v3" for request in server.requests))
+
+    def test_businesses_mutation_guards(self):
+        business = {"id": "business-synthetic", "locationId": "location-synthetic", "name": "Synthetic Business"}
+        def respond(request):
+            return 200, {"business": business} if request["method"] == "GET" else {"success": True}
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            env = self.synthetic_env(tmp, server)
+            commands = {"create": ["--name", business["name"]], "update": [business["id"], "--name", "Renamed"], "delete": [business["id"]]}
+            for command, flags in commands.items():
+                result = self.run_cli("businesses", command, *flags, cwd=tmp, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(json.loads(result.stdout)["dryRun"])
+                self.assertTrue(all(request["method"] == "GET" for request in server.requests))
+            for flags in ([], ["--confirm-delete", "business-other"]):
+                before = len(server.requests)
+                result = self.run_cli("--yes", "businesses", "delete", business["id"], *flags, cwd=tmp, env=env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(server.requests), before)
+            result = self.run_cli("--yes", "businesses", "delete", business["id"], "--confirm-delete", business["id"], cwd=tmp, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {"success": True})
+            writes = [request for request in server.requests if request["method"] != "GET"]
+            self.assertEqual([(request["method"], request["path"], request["body"], request["version"]) for request in writes], [("DELETE", "/businesses/business-synthetic", None, "v3")])
+
+    def test_businesses_invalid_inputs(self):
+        commands = [
+            ["list", "--limit", "0"], ["list", "--limit", "-1"], ["list", "--skip", "-1"],
+            ["create"], ["create", "--name", " "], ["update", "business-synthetic"],
+            ["update", "business-synthetic", "--description", " "], ["update", "business-synthetic", "--name", ""],
+        ]
+        for bad_id in ("../business-synthetic", "business?id=1", "business#1", "", "x" * 257):
+            commands.extend([["get", bad_id], ["update", bad_id, "--name", "Synthetic Business"], ["delete", bad_id, "--confirm-delete", bad_id]])
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(lambda request: (500, {})) as server:
+            for flags in commands:
+                with self.subTest(flags=flags):
+                    result = self.run_cli("--yes", "businesses", *flags, cwd=tmp, env=self.synthetic_env(tmp, server))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(server.requests, [])
+
+    def test_businesses_preflight_provider_failures(self):
+        business = {"id": "business-synthetic", "locationId": "location-synthetic", "name": "Synthetic Business"}
+        bad_businesses = [None, [], {}, {**business, "id": "business-other"}, {**business, "id": "../invalid"}, {**business, "locationId": "location-other"}, {**business, "name": " "}]
+        for key in ("id", "locationId", "name"):
+            bad_businesses.append({field: value for field, value in business.items() if field != key})
+        failures = [(code, {"private": "PRIVATE_PROVIDER_ERROR"}) for code in (403, 404, 429)]
+        failures += [(200, payload) for payload in (b"PRIVATE_PROVIDER_ERROR", b"\xff", [], {}, {"business": None})]
+        failures += [(200, {"business": value}) for value in bad_businesses]
+        state = {"response": None}
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(lambda request: state["response"]) as server:
+            for response in failures:
+                state["response"] = response
+                for command in (["get", business["id"]], ["update", business["id"], "--name", "Renamed"], ["delete", business["id"], "--confirm-delete", business["id"]]):
+                    with self.subTest(response=response, command=command):
+                        server.requests.clear()
+                        result = self.run_cli("--yes", "businesses", *command, cwd=tmp, env=self.synthetic_env(tmp, server))
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, "")
+                        self.assertNotIn("PRIVATE_PROVIDER_ERROR", result.stderr)
+                        self.assertNotIn("token-synthetic", result.stderr)
+                        self.assertEqual([request["method"] for request in server.requests], ["GET"])
+
+    def test_businesses_list_provider_failures(self):
+        good = {"id": "business-synthetic", "locationId": "location-synthetic", "name": "Synthetic Business"}
+        failures = [(code, {"private": "PRIVATE_PROVIDER_ERROR"}) for code in (403, 429)]
+        failures += [(200, payload) for payload in (b"PRIVATE_PROVIDER_ERROR", [], {}, {"businesses": {}}, {"businesses": [good, None]}, {"businesses": [good, {**good, "locationId": "location-other"}]}, {"businesses": [{"name": "Synthetic Business"}]})]
+        state = {"response": None}
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(lambda request: state["response"]) as server:
+            for response in failures:
+                state["response"] = response
+                server.requests.clear()
+                result = self.run_cli("businesses", "list", cwd=tmp, env=self.synthetic_env(tmp, server))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertNotIn("PRIVATE_PROVIDER_ERROR", result.stderr)
+                self.assertEqual(len(server.requests), 1)
+            state["response"] = 200, {"businesses": []}
+            result = self.run_cli("businesses", "list", cwd=tmp, env=self.synthetic_env(tmp, server))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {"businesses": []})
+
+    def test_businesses_mutation_unconfirmed(self):
+        business = {"id": "business-synthetic", "locationId": "location-synthetic", "name": "Synthetic Business"}
+        bad_businesses = [None, {}, {**business, "id": "../invalid"}, {**business, "locationId": "location-other"}]
+        bad_businesses += [{field: value for field, value in business.items() if field != key} for key in ("id", "locationId")]
+        failures = [(code, {"private": "PRIVATE_PROVIDER_ERROR"}) for code in (403, 429)]
+        failures += [(200, payload) for payload in (b"PRIVATE_PROVIDER_ERROR", [], {}, {"success": False}, {"success": "true"}, {"success": 1})]
+        state = {"response": None}
+        def respond(request):
+            return (200, {"business": business}) if request["method"] == "GET" else state["response"]
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            for command, flags in (("create", ["--name", business["name"]]), ("update", [business["id"], "--name", "Renamed"]), ("delete", [business["id"], "--confirm-delete", business["id"]])):
+                responses = list(failures)
+                if command != "delete":
+                    responses += [(200, {"success": True, "business": value}) for value in bad_businesses]
+                    responses += [(200, {"success": True, "buiseness": business})]
+                if command == "update":
+                    responses += [(200, {"success": True, "business": {**business, "id": "business-other"}})]
+                for response in responses:
+                    with self.subTest(command=command, response=response):
+                        state["response"] = response
+                        server.requests.clear()
+                        result = self.run_cli("--yes", "businesses", command, *flags, cwd=tmp, env=self.synthetic_env(tmp, server))
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, "")
+                        self.assertIn("unconfirmed", result.stderr)
+                        self.assertIn("No retry or rollback", result.stderr)
+                        self.assertNotIn("PRIVATE_PROVIDER_ERROR", result.stderr)
+                        self.assertEqual(len([request for request in server.requests if request["method"] != "GET"]), 1)
+
+    def test_businesses_help_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = clean_env(tmp)
+            env.pop("GHL_TEST_BASE_URL", None)
+            result = self.run_cli("businesses", "--help", cwd=tmp, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(set(result.stdout.split("{")[1].split("}")[0].split(",")), {"list", "get", "create", "update", "delete"})
+            result = self.run_cli("help", "agent", cwd=tmp, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for text in ("businesses list", "businesses get", "businesses create", "businesses update", "businesses delete", "with sources", "additional details", "Never invent", "name-only creation is noninteractive", "businesses.readonly", "businesses.write", "companyName text only"):
+                self.assertIn(text, result.stdout)
+            result = self.run_cli("businesses", "create", "--name", "Synthetic Business", cwd=tmp, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing GHL_LOCATION_ID", result.stderr)
+            env["GHL_LOCATION_ID"] = "location-synthetic"
+            result = self.run_cli("businesses", "create", "--name", "Synthetic Business", cwd=tmp, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["body"], {"name": "Synthetic Business", "locationId": "location-synthetic"})
+
+    def test_businesses_list_get(self):
+        business = {"id": "business-synthetic", "locationId": "location-synthetic", "name": "Synthetic Business"}
+        rows = [business, {**business, "id": "business-second"}]
+        def respond(request):
+            return 200, {"businesses": rows} if request["path"] == "/businesses/" else {"business": business}
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            env = self.synthetic_env(tmp, server)
+            for flags, query in [((), {"limit": ["100"], "skip": ["0"]}), (("--limit", "150", "--skip", "3"), {"limit": ["150"], "skip": ["3"]})]:
+                result = self.run_cli("businesses", "list", *flags, cwd=tmp, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"businesses": rows})
+                self.assertEqual(server.requests[-1]["query"], {"locationId": ["location-synthetic"], **query})
+            result = self.run_cli("businesses", "get", business["id"], cwd=tmp, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {"business": business})
+            self.assertEqual(server.requests[-1]["path"], "/businesses/business-synthetic")
+            self.assertTrue(all(request["method"] == "GET" and request["version"] == "v3" for request in server.requests))
+
     def run_cli(self, *args, cwd=None, env=None, input_text=None):
         return subprocess.run(
             [str(CLI), *args],

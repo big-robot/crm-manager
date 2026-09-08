@@ -2,6 +2,10 @@ tmp/
 docs/*
 !docs/agents/
 !docs/agents/*.md
+!docs/adr/
+docs/adr/*
+!docs/adr/0001-explicit-business-reassignment.md
+!docs/adr/0002-business-metadata-guidance.md
 backups/
 node_modules/
 __pycache__/

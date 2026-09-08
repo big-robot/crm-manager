@@ -46,6 +46,38 @@ ghl opportunities search --pipeline "Sales Pipeline" --status open --all
 ghl conversations search --contact-id CONTACT_ID
 ```
 
+## Businesses
+
+Business records are sub-account Companies, distinct from Agency Companies.
+They can be managed independently of Contacts. Reads require
+`businesses.readonly`; mutations require `businesses.write`. Update and delete
+also require read access to validate the Business in the configured sub-account.
+
+```sh
+ghl businesses list --limit 100 --skip 0
+ghl businesses get BUSINESS_ID
+ghl businesses create --name "Example Co"
+ghl --yes businesses create --name "Example Co" --website "https://example.invalid"
+ghl --yes businesses update BUSINESS_ID --description "Example description"
+ghl --yes businesses delete BUSINESS_ID --confirm-delete BUSINESS_ID
+```
+
+Before creation, offer known website, phone, email, address, and description
+metadata with sources, and ask whether the user has additional details. Never
+invent missing values. This is agent guidance: name-only creation remains
+noninteractive and valid, using the configured sub-account.
+
+Create and update accept `--phone`, `--email`, `--website`, `--address`, `--city`,
+`--postal-code`, `--state`, `--country`, and `--description`. Update also accepts
+`--name`. Only supplied nonempty fields are sent; field clearing is not offered.
+List makes one bounded request; `--skip` selects the offset. Renaming a Business
+does not update Contacts. Delete sends no Contact mutations; provider cascade
+behavior is unverified. An unconfirmed write may already have occurred: inspect
+the provider state before deciding what to do next.
+
+Contact `--company` sets `companyName` text only and does not establish a
+Business association.
+
 ## Contacts
 
 Search first to avoid duplicates:
