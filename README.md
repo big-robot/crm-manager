@@ -112,6 +112,8 @@ Recommended steady-state permissions:
 [
   "contacts.readonly",
   "contacts.write",
+  "businesses.readonly",
+  "businesses.write",
   "opportunities.readonly",
   "opportunities.write",
   "pipelines.readonly",
@@ -132,6 +134,8 @@ Notes:
 - Enable both read and write for contacts/opportunities/tags because the CLI
   searches before it writes.
 - `pipelines.readonly` is needed to resolve pipeline and stage ids by name.
+- `businesses.readonly` covers Business list/get and update/delete preflight;
+  `businesses.write` covers Business mutations in the configured sub-account.
 - The Conversations message write scope is used only by the fixed guarded
   `conversations log-capture` Internal Comment operation. The CLI exposes no
   generic send/reply/update/delete or customer-facing message write.
@@ -158,6 +162,8 @@ ghl fields --model opportunity
 ghl tags list
 ghl contacts search --query "Example Co"
 ghl contacts get CONTACT_ID
+ghl businesses list --limit 100 --skip 0
+ghl businesses get BUSINESS_ID
 ghl tasks search --limit 100
 ghl users list
 ghl opportunities search --pipeline "Sales Pipeline" --status all --limit 20
@@ -173,6 +179,86 @@ Opportunity search keeps `--limit` as a single bounded provider request. Use
 `--all` to follow the provider cursor through every matching page. Complete
 search prints only after exhaustion is established; invalid pagination state or
 a later-page failure exits without printing a partial opportunity list.
+
+### Businesses
+
+Businesses are organization records shown as Companies in a GHL sub-account,
+distinct from Agency Companies. CRUD does not require a Contact:
+
+```sh
+ghl businesses create --name "Example Co"
+ghl --yes businesses create --name "Example Co" --website "https://example.invalid"
+ghl --yes businesses update BUSINESS_ID --description "Example description"
+ghl --yes businesses delete BUSINESS_ID --confirm-delete BUSINESS_ID
+```
+
+Create requires `--name`; update accepts `--name`. Both accept optional `--phone`,
+`--email`, `--website`, `--address`, `--city`, `--postal-code`, `--state`,
+`--country`, and `--description`. Only supplied nonempty fields are sent, so a
+name-only update preserves existing metadata. Field clearing is not offered.
+Writes default to dry-run; scoped update/delete previews require read access.
+List returns one bounded provider page with default `--limit 100 --skip 0` and
+does not paginate automatically. `--limit` must be positive; `--skip` must be
+nonnegative.
+
+Before creating a Business, agents should offer known website, phone, email,
+address, and description values with their sources, and ask whether the user has
+additional details. Never invent missing values. This guidance does not add CLI
+prompts: name-only creation is valid using the configured location.
+
+Contact `--company` sets `companyName` text only; it does not establish a Business
+association. Business renames do not update Contacts. Business deletion issues
+no Contact writes; provider cascade behavior is unverified. If a write response
+cannot confirm success and identity, the CLI exits nonzero and reports the write
+as unconfirmed. It may already have occurred; no automatic retry or rollback is
+attempted.
+
+### Contact Business associations
+
+```sh
+ghl contacts business assign BUSINESS_ID --contact-id CONTACT_ID
+ghl --yes contacts business assign BUSINESS_ID --contact-id CONTACT_ID --contact-id SECOND_CONTACT_ID
+ghl --yes contacts business assign BUSINESS_ID --contact-id CONTACT_ID --replace
+ghl --yes contacts business remove BUSINESS_ID --contact-id CONTACT_ID
+```
+
+Assignment sets the real Business relationship and synchronizes `companyName`
+to that Business's current name. Replacing another Business requires `--replace`.
+Removal requires the expected Business ID and rejects a different association.
+It clears `companyName` with JSON null only when the text exactly matches the
+Business's current name, including case. Differing text is preserved. A proven
+unassociated Contact is a removal no-op, including its text.
+
+Each command accepts 1 to 50 unique Contact IDs and validates the Business and
+every Contact's identity and configured location before writing. There is no
+batch splitting. Dry runs show existing and target associations, proposed name
+updates, and planned requests; reads still run. Preflight is a snapshot and does
+not prevent concurrent changes.
+
+One bulk association write precedes the minimal name updates. Only IDs
+affirmatively returned by the bulk operation can receive a name update; a valid
+subset leaves other IDs unconfirmed and exits nonzero. Each name PUT is followed
+by a scoped Contact GET to confirm the saved value. Clearing is confirmed only
+when the GET omits `companyName`. A PUT response alone is not proof of a saved
+name. Preserved or unchanged text is reported as such, not as a verified write.
+
+Results include one outcome per requested Contact. `confirmed` identifies a
+verified step, `unconfirmed` means a write may have occurred, and `unattempted`
+means that step was not sent. `noop`, `preserved`, and `unchanged` describe the
+preflight decisions. Failed preflight sends no writes. A request failure,
+malformed bulk result, or failed name readback stops later writes and exits
+nonzero with prior progress. No retry, rollback, or transaction guarantee is
+provided. Inspect provider state before deciding how to continue.
+
+Business reads require `businesses.readonly`; Business CRUD mutations require
+`businesses.write`. Contact GET and PUT require `contacts.readonly` and
+`contacts.write`, respectively. Bulk assignment/removal worked with the current
+integration, but its isolated minimum scope was not established. Authorization
+failures stop the command; they do not broaden permissions.
+
+Business renames leave Contact text stale until explicitly repaired, for example
+by assigning the already-associated Contacts again. Contact `--company` remains
+text-only and neither creates a Business nor establishes an association.
 
 `conversations logged-messages` is read-only. It resolves exactly one Contact
 and associated existing Conversation, reads all Internal Comments, and reports
