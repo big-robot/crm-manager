@@ -1,4 +1,6 @@
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+import ast
+import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
@@ -66,7 +68,8 @@ class SyntheticGhlServer:
                 encoded = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(encoded)))
+                if "Content-Length" not in response_headers:
+                    self.send_header("Content-Length", str(len(encoded)))
                 for name, value in response_headers.items():
                     self.send_header(name, value)
                 self.end_headers()
@@ -282,6 +285,108 @@ class GhlCliTests(unittest.TestCase):
                         self.assertNotIn("may have occurred", result.stderr)
                         self.assertNotIn("token-synthetic", result.stderr)
                         self.assertEqual(server.requests, [])
+
+    def test_businesses_truncated_responses(self):
+        business = {"id": "business-synthetic", "locationId": "location-synthetic", "name": "Synthetic Business"}
+        commands = {
+            "list": [], "get": [business["id"]],
+            "create": ["--name", business["name"]],
+            "update": [business["id"], "--name", "Renamed"],
+            "delete": [business["id"], "--confirm-delete", business["id"]],
+        }
+        state = {"fail_reads": False}
+        def respond(request):
+            if request["method"] == "GET" and not state["fail_reads"]:
+                return 200, {"business": business}
+            return 200, b"PRIVATE_PARTIAL_RESPONSE", {"Content-Length": "100", "Connection": "close"}
+        with tempfile.TemporaryDirectory() as tmp, SyntheticGhlServer(respond) as server:
+            env = self.synthetic_env(tmp, server)
+            help_result = self.run_cli("businesses", "--help", cwd=tmp, env=env)
+            self.assertEqual(set(commands), set(help_result.stdout.split("{")[1].split("}")[0].split(",")))
+            for command, flags in commands.items():
+                for fail_reads in ([True] if command in ("list", "get") else [False] if command == "create" else [False, True]):
+                    with self.subTest(command=command, fail_reads=fail_reads):
+                        state["fail_reads"] = fail_reads
+                        server.requests.clear()
+                        result = self.run_cli("--yes", "businesses", command, *flags, cwd=tmp, env=env)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, "")
+                        self.assertNotIn("Traceback", result.stderr)
+                        self.assertNotIn("PRIVATE_PARTIAL_RESPONSE", result.stderr)
+                        writes = [request for request in server.requests if request["method"] != "GET"]
+                        self.assertEqual(len(writes), 0 if fail_reads else 1)
+                        self.assertEqual("unconfirmed" in result.stderr, not fail_reads)
+
+    def test_businesses_transport_exception_boundary(self):
+        module = runpy.run_path(str(CLI))
+        handler_globals = module["business_mutation"].__globals__
+        handler_globals["api_base_url"] = lambda: "http://localhost"
+        handler_globals["token"] = lambda: "token-synthetic"
+        failures = {
+            OSError: [OSError, TimeoutError, ConnectionResetError, BrokenPipeError],
+            http.client.HTTPException: [
+                http.client.HTTPException, http.client.RemoteDisconnected, http.client.BadStatusLine,
+                lambda message: http.client.IncompleteRead(message.encode(), 100),
+            ],
+        }
+        self.assertEqual(set(failures), set(module["BUSINESS_TRANSPORT_ERRORS"]))
+        methods = {"GET", "POST", "PUT", "DELETE"}
+        production_methods = {
+            node.args[0].value for node in ast.walk(ast.parse(CLI.read_text()))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in {"business_request", "business_mutation"}
+            and node.args and isinstance(node.args[0], ast.Constant)
+        }
+        self.assertEqual(methods, production_methods)
+        calls = []
+        state = {}
+        class Response:
+            def __enter__(self):
+                if state["phase"] == "enter":
+                    raise state["error"]
+                return self
+            def read(self):
+                if state["phase"] == "read":
+                    raise state["error"]
+                return b'{"success":true}'
+            def __exit__(self, *_args):
+                if state["phase"] == "exit":
+                    raise state["error"]
+        class Opener:
+            def open(self, request):
+                calls.append(request.get_method())
+                if state["phase"] == "open":
+                    raise state["error"]
+                return Response()
+        handler_globals["HTTP_OPENER"] = Opener()
+        for factories in failures.values():
+            for factory in factories:
+                for method in methods:
+                    for phase in ("open", "enter", "read", "exit"):
+                        with self.subTest(error=factory, method=method, phase=phase):
+                            state.update(phase=phase, error=factory("PRIVATE_TRANSPORT_ERROR"))
+                            calls.clear()
+                            stdout, stderr = io.StringIO(), io.StringIO()
+                            with redirect_stdout(stdout), redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                                if method == "GET":
+                                    module["business_request"](method, "/businesses/business-synthetic")
+                                else:
+                                    module["business_mutation"](method, "/businesses/business-synthetic", yes=True)
+                            self.assertNotEqual(raised.exception.code, 0)
+                            self.assertEqual(calls, [method])
+                            self.assertEqual(stdout.getvalue(), "")
+                            self.assertNotIn("PRIVATE_TRANSPORT_ERROR", stderr.getvalue())
+                            self.assertEqual("unconfirmed" in stderr.getvalue(), method != "GET")
+        for method in methods - {"GET"}:
+            calls.clear()
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                module["business_mutation"](method, "/businesses/business-synthetic")
+            self.assertTrue(json.loads(stdout.getvalue())["dryRun"])
+            self.assertEqual(calls, [])
+        state.update(phase="open", error=KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            module["business_mutation"]("POST", "/businesses/", yes=True)
 
     def test_businesses_help_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:

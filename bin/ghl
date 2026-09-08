@@ -2,6 +2,7 @@
 import argparse
 from datetime import datetime
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -17,6 +18,7 @@ BASE_URL = "https://services.leadconnectorhq.com"
 VERSION = "2021-07-28"
 TASKS_VERSION = "v3"
 BUSINESSES_VERSION = "v3"
+BUSINESS_TRANSPORT_ERRORS = (OSError, http.client.HTTPException)
 BUSINESS_FIELDS = {
     "name": "name",
     "phone": "phone",
@@ -450,14 +452,20 @@ def validate_business(business, *, expected_id=None, require_name=False):
     return business
 
 
+def business_request(method, path, **kwargs):
+    try:
+        return request(
+            method, path, version=BUSINESSES_VERSION, sanitize_errors=True, **kwargs,
+        )
+    except BUSINESS_TRANSPORT_ERRORS:
+        fail("GHL Business transport failed")
+
+
 def scoped_business(business_id):
     if not valid_provider_id(business_id):
         fail("invalid Business id")
     location_id()
-    data = request(
-        "GET", f"/businesses/{business_id}",
-        version=BUSINESSES_VERSION, sanitize_errors=True,
-    )
+    data = business_request("GET", f"/businesses/{business_id}")
     business = data.get("business") if isinstance(data, dict) else None
     return validate_business(business, expected_id=business_id, require_name=True)
 
@@ -465,10 +473,9 @@ def scoped_business(business_id):
 def list_businesses(args):
     if args.limit <= 0 or args.skip < 0:
         fail("Business limit must be positive and skip must be nonnegative")
-    data = request(
+    data = business_request(
         "GET", "/businesses/",
         query={"locationId": location_id(), "limit": args.limit, "skip": args.skip},
-        version=BUSINESSES_VERSION, sanitize_errors=True,
     )
     if not isinstance(data, dict) or not isinstance(data.get("businesses"), list):
         fail("invalid Business list response")
@@ -487,10 +494,7 @@ def business_mutation(method, path, *, body=None, yes=False, expected_id=None):
         api_base_url()
         token()
     try:
-        data = request(
-            method, path, body=body, yes=yes,
-            version=BUSINESSES_VERSION, sanitize_errors=True,
-        )
+        data = business_request(method, path, body=body, yes=yes)
         if yes:
             if not isinstance(data, dict) or data.get("success") is not True:
                 fail("invalid Business mutation response")
